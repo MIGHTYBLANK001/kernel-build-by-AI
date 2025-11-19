@@ -1,0 +1,37 @@
+
+From 222222222222222222222 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 2/3] netfilter: xt_qtaguid: fix null pointer deref/UAF when untagging sockets
+
+diff --git a/net/netfilter/xt_qtaguid.c b/net/netfilter/xt_qtaguid.c
+index 89abcd0..fedcba9 100644
+--- a/net/netfilter/xt_qtaguid.c
++++ b/net/netfilter/xt_qtaguid.c
+@@ -1234,6 +1234,12 @@ static int qtaguid_untag(struct sock *sk, struct proc_qtu_data *pqd)
+        struct sock_tag *st = qtaguid_find_tag(sk);
+-       /* existing code assumed st and pqd are valid and proceeds ... */
++       /* 防御式：若未找到 sock_tag 或 pqd 为空则直接返回 */
++       if (!st || IS_ERR_OR_NULL(st))
++               return -EINVAL;
++       if (IS_ERR_OR_NULL(pqd))
++               return -EINVAL;
++
+        /* 原逻辑：从 pqd->sock_tag_list 中移除并释放 st */
+-       list_del(&st->list);
+-       kfree(st);
++       if (!list_empty(&pqd->sock_tag_list)) {
++               list_del(&st->list);
++       }
++       kfree(st);
+        return 0;
+ }
+@@ -1301,6 +1307,9 @@ static int qtaguid_ctrl_proc_write(struct file *file, const char __user *ubuf,
+        /* 解析命令 ... */
+        if (cmd == 'U') { /* untag */
+-               ret = qtaguid_untag(sk, pqd_entry);
++               if (IS_ERR_OR_NULL(pqd_entry)) {
++                       ret = -EINVAL;
++               } else {
++                       ret = qtaguid_untag(sk, pqd_entry);
++               }
+        }
+        /* 其他分支 ... */

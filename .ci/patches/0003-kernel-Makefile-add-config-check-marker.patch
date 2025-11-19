@@ -1,0 +1,19 @@
+
+From 333333333333333333333 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 3/3] kernel/Makefile: append local version tag for docker-ready builds
+
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 0123abc..cba3210 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -1,5 +1,10 @@
+ # SPDX-License-Identifier: GPL-2.0
+ # Kernel Makefile
++
++# Add a local version tag so that dmesg/uname show docker-ready build.
++# (You can also set CONFIG_LOCALVERSION in defconfig instead.)
++EXTRAVERSION := $(EXTRAVERSION)-docker-ready
++
+ ifdef CONFIG_BUILD_ARM64_VDSO
+ obj-$(CONFIG_ARM64) += arm64/
+ endif
