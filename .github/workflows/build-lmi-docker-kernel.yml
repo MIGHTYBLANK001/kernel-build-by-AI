@@ -1,5 +1,4 @@
- 
-name: Build Docker-ready kernel (SM8250/lmi) — v3.6 (LLVM tools + clang target)
+ name: Build Docker-ready kernel (SM8250/lmi) — v3.6 (LLVM tools + clang target)
 
 on:
   workflow_dispatch:
