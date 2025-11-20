@@ -196,7 +196,6 @@ jobs:
           make LLVM="${LLVM}" O="${OUT}" -j"$(nproc)"
           ls -la "${OUT}/arch/arm64/boot" || true
 
-      # -------- 打包片段（已修复：通过 env 传入 inputs，python3 -c 解码 JSON）--------
       - name: Fetch AnyKernel3 & pack zip
         shell: bash
         env:
@@ -217,7 +216,7 @@ jobs:
           DEV_STR="$(python3 -c 'import os, json; print(json.loads(os.environ["DEV_RAW"]))')"
           SUP_STR="$(python3 -c 'import os, json; print(json.loads(os.environ["SUP_RAW"]))')"
 
-          # 修改 anykernel.sh 配置项
+          # 修改 anykernel.sh 配置项（显示字符串/设备/支持版本）
           awk -v kstr="$AK3_STR" -v dev="$DEV_STR" -v sup="$SUP_STR" '
             BEGIN{FS=OFS="="}
             /^kernel.string=/      { $0="kernel.string="kstr; print; next }
@@ -226,19 +225,29 @@ jobs:
             { print }
           ' anykernel.sh > anykernel.sh.tmp && mv anykernel.sh.tmp anykernel.sh
 
-          # 收集内核镜像并打包
+          # 收集内核镜像（优先级：Image.gz-dtb > Image.gz > Image）
+          SRC_DIR="../kernel_src/${OUT_DIR}/arch/arm64/boot"
           mkdir -p kernel
-          if [ -f "../kernel_src/${OUT_DIR}/arch/arm64/boot/Image.gz-dtb" ]; then
-            cp "../kernel_src/${OUT_DIR}/arch/arm64/boot/Image.gz-dtb" kernel/
-          elif [ -f "../kernel_src/${OUT_DIR}/arch/arm64/boot/Image.gz" ]; then
-            cp "../kernel_src/${OUT_DIR}/arch/arm64/boot/Image.gz" kernel/
+
+          if [ -f "${SRC_DIR}/Image.gz-dtb" ]; then
+            cp "${SRC_DIR}/Image.gz-dtb" kernel/
+            echo "[INFO] Using Image.gz-dtb"
+          elif [ -f "${SRC_DIR}/Image.gz" ]; then
+            cp "${SRC_DIR}/Image.gz" kernel/
+            echo "[INFO] Using Image.gz"
+          elif [ -f "${SRC_DIR}/Image" ]; then
+            echo "[INFO] Only bare Image found; compressing to Image.gz"
+            # 压缩为 Image.gz 以满足常见 AnyKernel3 期望
+            gzip -c9 "${SRC_DIR}/Image" > kernel/Image.gz
           else
-            echo "No Image.gz[-dtb] found!" && exit 1
+            echo "[ERROR] No kernel image found (Image.gz-dtb / Image.gz / Image)!" >&2
+            ls -la "${SRC_DIR}" || true
+            exit 1
           fi
 
           ZIP="../Docker-ready-kernel-${DEV_STR}-${BRANCH_IN}.zip"
           zip -r9 "$ZIP" .
-          [ -f "$ZIP" ] || { echo "ZIP not created"; exit 1; }
+          [ -f "$ZIP" ] || { echo "[ERROR] ZIP not created"; exit 1; }
           echo "AK3 zip: $ZIP"
 
       - name: Upload artifacts
