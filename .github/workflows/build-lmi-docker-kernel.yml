@@ -196,101 +196,61 @@ jobs:
           make LLVM="${LLVM}" O="${OUT}" -j"$(nproc)"
           ls -la "${OUT}/arch/arm64/boot" || true
 
-      - name: Fetch AnyKernel3 & pack zip
+      - name: Pack AnyKernel3 zip
         shell: bash
-        env:
-          AK3_RAW: ${{ toJSON(inputs.ak3_kernel_string) }}
-          DEV_RAW: ${{ toJSON(inputs.device) }}
-          SUP_RAW: ${{ toJSON(inputs.ak3_supported_versions) }}
-          BRANCH_IN: ${{ inputs.branch }}
-          OUT_DIR: ${{ env.OUT }}
         run: |
           set -euo pipefail
-
-          # 拉取 AnyKernel3
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
           cd ak3
 
-          # 安全解码 JSON（避免 heredoc/转义问题）
-          AK3_STR="$(python3 -c 'import os, json; print(json.loads(os.environ["AK3_RAW"]))')"
-          DEV_STR="$(python3 -c 'import os, json; print(json.loads(os.environ["DEV_RAW"]))')"
-          SUP_STR="$(python3 -c 'import os, json; print(json.loads(os.environ["SUP_RAW"]))')"
+          # 修改 anykernel.sh 基本兼容性
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
+          sed -i 's!BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!BLOCK=auto;!g' anykernel.sh
+          sed -i 's/is_slot_device=0;/is_slot_device=auto;/g' anykernel.sh
 
-          # 修改 anykernel.sh 配置项（显示字符串/设备/支持版本）
-          awk -v kstr="$AK3_STR" -v dev="$DEV_STR" -v sup="$SUP_STR" '
-            BEGIN{FS=OFS="="}
-            /^kernel.string=/      { $0="kernel.string="kstr; print; next }
-            /^device.name1=/       { $0="device.name1="dev; print; next }
-            /^supported.versions=/ { $0="supported.versions="sup; print; next }
-            { print }
-          ' anykernel.sh > anykernel.sh.tmp && mv anykernel.sh.tmp anykernel.sh
-
-          # 收集内核镜像（优先级：Image.gz-dtb > Image.gz > Image）
-          SRC_DIR="../kernel_src/${OUT_DIR}/arch/arm64/boot"
+          SRC="../kernel_src/${OUT}/arch/${ARCH}/boot"
           mkdir -p kernel
 
-          if [ -f "${SRC_DIR}/Image.gz-dtb" ]; then
-            cp "${SRC_DIR}/Image.gz-dtb" kernel/
-            echo "[INFO] Using Image.gz-dtb"
-          elif [ -f "${SRC_DIR}/Image.gz" ]; then
-            cp "${SRC_DIR}/Image.gz" kernel/
-            echo "[INFO] Using Image.gz"
-          elif [ -f "${SRC_DIR}/Image" ]; then
-            echo "[INFO] Only bare Image found; compressing to Image.gz"
-            # 压缩为 Image.gz 以满足常见 AnyKernel3 期望
-            gzip -c9 "${SRC_DIR}/Image" > kernel/Image.gz
+          # 优先级：Image.gz-dtb > Image.gz > Image（压缩）
+          if [ -f "${SRC}/Image.gz-dtb" ]; then
+            cp "${SRC}/Image.gz-dtb" kernel/
+          elif [ -f "${SRC}/Image.gz" ]; then
+            cp "${SRC}/Image.gz" kernel/
+          elif [ -f "${SRC}/Image" ]; then
+            echo "[INFO] Only Image found; compressing to Image.gz"
+            gzip -c9 "${SRC}/Image" > kernel/Image.gz
           else
-            echo "[ERROR] No kernel image found (Image.gz-dtb / Image.gz / Image)!" >&2
-            ls -la "${SRC_DIR}" || true
-            exit 1
+            echo "[ERROR] No kernel image found!" && ls -la "${SRC}" && exit 1
           fi
 
-          ZIP="../Docker-ready-kernel-${DEV_STR}-${BRANCH_IN}.zip"
+          # 可选附带 dtbo.img / dtb
+          [ -f "${SRC}/dtbo.img" ] && cp "${SRC}/dtbo.img" kernel/ || true
+          [ -d "${SRC}/dtb" ] && cp -r "${SRC}/dtb" kernel/ || true
+
+          ZIP="../Docker-ready-kernel-${{ inputs.device }}-${{ inputs.branch }}.zip"
           zip -r9 "$ZIP" .
-          [ -f "$ZIP" ] || { echo "[ERROR] ZIP not created"; exit 1; }
           echo "AK3 zip: $ZIP"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: lmi-docker-kernel-${{ inputs.branch }}-v3.7.2
+          name: kernel-build-${{ inputs.device }}-${{ inputs.branch }}
           path: |
             Docker-ready-kernel-${{ inputs.device }}-${{ inputs.branch }}.zip
             kernel_src/out/arch/arm64/boot/*
             kernel_src/out/.config
 
-      - name: Prepare Release metadata
-        id: meta
-        shell: bash
-        run: |
-          set -e
-          DATE=$(date +'%Y%m%d')
-          if [ -z "${{ inputs.release_tag }}" ]; then
-            TAG="lmi-docker-${{ inputs.branch }}-${DATE}-v3.7.2"
-          else
-            TAG="${{ inputs.release_tag }}"
-          fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "name=Docker-ready kernel for lmi (${TAG})" >> "$GITHUB_OUTPUT"
-          {
-            echo "body= ## Docker-ready kernel for lmi — v3.7.2"
-            echo " - Repo: ${{ inputs.repo_url }}"
-            echo " - Branch: ${{ inputs.branch }}"
-            echo " - Defconfig: lmi_defconfig"
-            echo " - LLVM tools hardened + Clang AArch64 target fixed"
-            echo " - Includes Docker CONFIGs (namespaces/cgroups/overlayfs/netfilter/ipset/veth/bridge)"
-            echo " - xt_qtaguid patch: auto-detect path; non-fatal if fails"
-            echo " - AK3 packing fixed (shell:bash + JSON-safe string injection)"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Create Release and upload assets
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: ${{ steps.meta.outputs.name }}
-          body: ${{ steps.meta.outputs.body }}
-          draft: false
-          prerelease: false
+          tag_name: v${{ github.run_number }}
+          name: "Kernel Build - ${{ inputs.device }} (${{ inputs.branch }})"
+          body: |
+            ## Docker-ready kernel for ${{ inputs.device }}
+            - Branch: ${{ inputs.branch }}
+            - Includes AnyKernel3 zip for flashing
           files: |
             Docker-ready-kernel-${{ inputs.device }}-${{ inputs.branch }}.zip
             kernel_src/out/arch/arm64/boot/Image*
