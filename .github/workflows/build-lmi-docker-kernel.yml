@@ -103,7 +103,12 @@ jobs:
           set -eux
           cd workspace/kernel_src
           [ -f "${DEFCONFIG_PATH}" ] || { echo "::error::DEFCONFIG missing"; exit 1; }
-          make O=out ARCH=${ARCH} HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld "${DEFCONFIG_PATH}"
+          # ✅ 正确：不要带路径，直接用目标名 lmi_defconfig
+          make O=out ARCH=${ARCH} HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld lmi_defconfig
+
+          # 如果你更偏好显式路径，也可以改成：
+          # make O=out ARCH=${ARCH} HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld \
+          #     KCONFIG_DEFCONFIG=${DEFCONFIG_PATH} defconfig
 
       - name: Build kernel scripts (to get scripts/config)
         run: |
