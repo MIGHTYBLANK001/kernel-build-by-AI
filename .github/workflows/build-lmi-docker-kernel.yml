@@ -90,6 +90,13 @@ jobs:
             echo "xt_qtaguid not found; skip."
           fi
 
+
+      - name: Source tree mrproper (clean srctree)
+        run: |
+         set -eux
+         cd workspace/kernel_src
+         make ARCH=arm64 mrproper
+
       # --- Host 阶段：清理/defconfig/scripts（只用系统 gcc/ld；不设 LLVM=1/LD） ---
       - name: Kernel clean (host tools only)
         run: |
@@ -119,7 +126,7 @@ jobs:
             HOSTCC=gcc HOSTLD=/usr/bin/ld \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LD=aarch64-linux-gnu-ld \
-            scripts
+
 
       # --- 开启全部 Docker 支持项（参考 moby check-config） ---
       - name: Enable ALL Docker-related kernel configs
@@ -181,9 +188,12 @@ jobs:
         run: |
           set -eux
           cd workspace/kernel_src
+          # 仅在目标编译步临时加入工具链到 PATH，供 lld-version.sh 等查找 ld.lld
+          export PATH="${PWD}/../../${CLANG_DIR}/bin:${PATH}"
+
           JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo ${THREADS_DEFAULT})"
-          make -j"${JOBS}" O=out ARCH=arm64 \
-            LLVM="${PWD}/../../${CLANG_DIR}/bin/" \
+          make -j"${JOBS}" O=out ARCH=${ARCH} \
+            LLVM=1 LLVM_IAS=1 \
             CC=clang LD=ld.lld \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
