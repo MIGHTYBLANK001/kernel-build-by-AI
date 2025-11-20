@@ -1,223 +1,161 @@
-name: Build lmi Docker-supported Kernel
+name: Build Kernel (AOSP/crDroid) → AnyKernel3 (store-only) → Release
 
 on:
   workflow_dispatch:
     inputs:
-      kernel_branch:
-        description: "Kernel repo branch to use (default: android16-aptusitu-new)"
-        required: false
-        default: "android16-aptusitu-new"
-      clang_tag:
-        description: "Proton-Clang release tag (e.g. 20210522)"
-        required: false
-        default: "20210522"
+      defconfig:
+        description: "内核 defconfig（例如 vendor/mydevice_defconfig）"
+        required: true
+      branch:
+        description: "ROM/AOSP 分支（例如 crdroid-15.x；用于包名/tag）"
+        required: true
+  push:
+    branches:
+      - "*"
+
+permissions:
+  contents: write
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  THREADS_DEFAULT: 8
+  # 固定 Proton-Clang 版本（可按需升级）
+  CLANG_URL: https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.tar.gz
+  CLANG_DIR: toolchains/proton-clang
+  ANYKERNEL3_REPO: https://github.com/osm0sis/AnyKernel3.git
 
 jobs:
-  build:
-    runs-on: ubuntu-22.04
-
-    env:
-      KERNEL_REPO: "https://github.com/ApartTUSITU/kernel_xiaomi_sm8250_mod"
-      DEVICE: "lmi"
-      DEFCONFIG_PATH: "arch/arm64/configs/lmi_defconfig"
-      OUTDIR: "out"
-
+  build-package-release:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout current repo (for workflow context)
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      # ---- 安装依赖（必须在任何构建/脚本之前） ----
+      - name: Install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential bc bison flex libssl-dev \
-            libelf-dev libncurses-dev \
-            git wget curl unzip zip ccache python-is-python3 \
-            clang lld llvm \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-            device-tree-compiler rsync
+            build-essential \
+            coreutils util-linux \
+            bc bison flex libssl-dev \
+            libelf-dev dwarves pkg-config zstd \
+            zip unzip python3 rsync ccache
 
-      - name: Clone kernel source (latest branch by input)
+      # ---- 获取 Proton-Clang 并加入 PATH ----
+      - name: Fetch Proton-Clang (20210522) & setup PATH
         run: |
-          BRANCH="${{ github.event.inputs.kernel_branch }}"
-          echo "Cloning $KERNEL_REPO (branch: ${BRANCH})"
-          git clone --depth=1 --branch "${BRANCH}" "$KERNEL_REPO" kernel
-          test -f "kernel/${DEFCONFIG_PATH}" || { echo "::error::${DEFCONFIG_PATH} not found"; exit 1; }
+          mkdir -p "${CLANG_DIR}"
+          curl -L "${CLANG_URL}" | tar -xz --strip-components=1 -C "${CLANG_DIR}"
+          echo "${PWD}/${CLANG_DIR}/bin" >> "$GITHUB_PATH"
 
-      - name: Download required patches
-        working-directory: kernel
+      # ---- 导出环境变量（遵循 Proton-Clang README 建议） ----
+      - name: Export env for LLVM/Clang build
         run: |
-          set -eux
-          curl -L --retry 5 -o ../cgroup.patch \
-            "https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/patch/cgroup.patch"
-          curl -L --retry 5 -o ../xt_qtaguid.patch \
-            "https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/patch/xt_qtaguid.patch"
+          {
+            echo "ARCH=${ARCH}"
+            echo "SUBARCH=${SUBARCH}"
+            echo "CC=clang"
+            echo "LD=ld.lld"
+            echo "LLVM=1"
+            echo "CROSS_COMPILE=aarch64-linux-gnu-"
+            echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          } >> "$GITHUB_ENV"
 
-      - name: Apply cgroup.patch (mandatory)
-        working-directory: kernel
+      # ---- 清理 & defconfig ----
+      - name: Kernel clean
         run: |
-          set -eux
-          (git apply ../cgroup.patch) || (patch -p1 < ../cgroup.patch)
-          echo "Applied cgroup.patch"
+          make O=out ARCH=${ARCH} clean || true
+          make O=out ARCH=${ARCH} mrproper || true
 
-      - name: Conditionally apply xt_qtaguid.patch
-        working-directory: kernel
+      - name: Kernel defconfig
         run: |
-          set -eux
-          HAVE_FILE=false
-          HAVE_CONFIG=false
-          test -f net/netfilter/xt_qtaguid.c && HAVE_FILE=true
-          grep -q "CONFIG_NETFILTER_XT_MATCH_QTAGUID" "${DEFCONFIG_PATH}" && HAVE_CONFIG=true
-          if $HAVE_FILE || $HAVE_CONFIG; then
-            echo "xt_qtaguid exists (file/config). Applying patch..."
-            (git apply ../xt_qtaguid.patch) || (patch -p1 < ../xt_qtaguid.patch)
-          else
-            echo "xt_qtaguid not present. Skip patch."
+          DEFCONFIG="${{ github.event.inputs.defconfig }}"
+          if [ -z "${DEFCONFIG}" ]; then
+            echo "No defconfig provided via workflow_dispatch; please set inputs.defconfig"
+            exit 1
+          fi
+          make O=out ARCH=${ARCH} \
+            CC=${CC} LD=${LD} LLVM=${LLVM} \
+            CROSS_COMPILE=${CROSS_COMPILE} \
+            CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32} \
+            "${DEFCONFIG}"
+
+      # ---- 构建内核 ----
+      - name: Build kernel
+        run: |
+          JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo ${THREADS_DEFAULT})"
+          make -j"${JOBS}" O=out ARCH=${ARCH} \
+            CC=${CC} LD=${LD} LLVM=${LLVM} \
+            CROSS_COMPILE=${CROSS_COMPILE} \
+            CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32}
+
+      # ---- 查找生成的镜像（支持多常见命名）----
+      - name: Locate built image
+        id: findimg
+        run: |
+          set -e
+          CANDIDATES=(
+            "out/arch/arm64/boot/Image"
+            "out/arch/arm64/boot/Image.gz"
+            "out/arch/arm64/boot/Image.gz-dtb"
+            "out/arch/arm64/boot/Image-dtb"
+            "arch/arm64/boot/Image"
+            "arch/arm64/boot/Image.gz"
+            "arch/arm64/boot/Image.gz-dtb"
+          )
+          for f in "${CANDIDATES[@]}"; do
+            if [ -f "$f" ]; then
+              echo "image=$f" >> "$GITHUB_OUTPUT"
+              echo "Found image: $f"
+              exit 0
+            fi
+          done
+          echo "::error::未找到内核镜像（Image*/Image.gz*/Image.gz-dtb 等）。请检查构建产物与 defconfig。"
+          exit 1
+
+      # ---- 获取 AnyKernel3 模板并调整 ----
+      - name: Clone AnyKernel3
+        run: |
+          git clone --depth=1 "${ANYKERNEL3_REPO}" ak3
+          # 关闭设备检查以适配通用 AOSP/crDroid；如需开启，后续可按机型改写
+          sed -i "s/^do.devicecheck=.*/do.devicecheck=0/" ak3/anykernel.sh
+          # 显示字符串（便于区分构建来源）
+          BRANCH="${{ github.event.inputs.branch || github.ref_name }}"
+          sed -i "s/^kernel.string=.*/kernel.string=${BRANCH} $(date +%Y-%m-%d)/" ak3/anykernel.sh
+
+      # ---- 将镜像放在包根目录 & 可选复制模块 ----
+      - name: Prepare AK3 payload (image at zip root)
+        run: |
+          cp "${{ steps.findimg.outputs.image }}" ak3/
+          # 若存在内核模块，按 AK3 约定放入 modules 目录（可选）
+          if [ -d "out/lib/modules" ]; then
+            rsync -a out/lib/modules/ ak3/modules/system/lib/modules/
           fi
 
-      - name: Create Docker support Kconfig fragment
-        working-directory: kernel
+      # ---- 以 store-only 方式打包（不压缩）----
+      - name: Make flashable zip (zip -0 store-only)
+        id: mkzip
         run: |
-          cat > docker.config <<'EOF'
-          # ----- Namespaces -----
-          CONFIG_NAMESPACES=y
-          CONFIG_NET_NS=y
-          CONFIG_PID_NS=y
-          CONFIG_IPC_NS=y
-          CONFIG_UTS_NS=y
-          CONFIG_USER_NS=y
+          BRANCH="${{ github.event.inputs.branch || github.ref_name }}"
+          TS="$(date +%Y%m%d-%H%M%S)"
+          PKG="${BRANCH}-${TS}"
+          (cd ak3 && zip -0 -r "../${PKG}.zip" .)
+          echo "pkg=${PKG}" >> "$GITHUB_OUTPUT"
+          ls -lh "${PKG}.zip"
 
-          # ----- Cgroups & controllers -----
-          CONFIG_CGROUPS=y
-          CONFIG_CGROUP_BPF=y
-          CONFIG_CGROUP_CPUACCT=y
-          CONFIG_CGROUP_DEVICE=y
-          CONFIG_CGROUP_FREEZER=y
-          CONFIG_CGROUP_SCHED=y
-          CONFIG_CPUSETS=y
-          CONFIG_MEMCG=y
-          CONFIG_MEMCG_SWAP=y
-          CONFIG_MEMCG_SWAP_ENABLED=y
-          CONFIG_CGROUP_PIDS=y
-          CONFIG_CGROUP_HUGETLB=y
-          CONFIG_BLK_CGROUP=y
-          CONFIG_BLK_DEV_THROTTLING=y
-          CONFIG_NET_CLS_CGROUP=y
-          CONFIG_CGROUP_NET_PRIO=y
-          CONFIG_CFS_BANDWIDTH=y
-          CONFIG_FAIR_GROUP_SCHED=y
-          CONFIG_RT_GROUP_SCHED=y
-
-          # ----- Security / keys / seccomp -----
-          CONFIG_KEYS=y
-          CONFIG_SECCOMP=y
-          CONFIG_SECCOMP_FILTER=y
-
-          # ----- Filesystems (for containers) -----
-          CONFIG_OVERLAY_FS=y
-          CONFIG_POSIX_MQUEUE=y
-          CONFIG_BTRFS_FS=y
-          CONFIG_BTRFS_FS_POSIX_ACL=y
-          CONFIG_DM_THIN_PROVISIONING=y
-
-          # ----- Networking for containers -----
-          CONFIG_VETH=y
-          CONFIG_BRIDGE=y
-          CONFIG_BRIDGE_NETFILTER=y
-          CONFIG_VLAN_8021Q=y
-          CONFIG_BRIDGE_VLAN_FILTERING=y
-          CONFIG_MACVLAN=y
-          CONFIG_IPVLAN=y
-          CONFIG_XFRM=y
-          CONFIG_XFRM_ALGO=y
-          CONFIG_INET_XFRM_MODE_TRANSPORT=y
-
-          # ----- Netfilter / iptables / NAT / IPVS -----
-          CONFIG_NETFILTER=y
-          CONFIG_NETFILTER_ADVANCED=y
-          CONFIG_NF_CONNTRACK=y
-          CONFIG_NF_NAT=y
-          CONFIG_NF_NAT_IPV4=y
-          CONFIG_IP_NF_IPTABLES=y
-          CONFIG_IP_NF_FILTER=y
-          CONFIG_IP_NF_TARGET_MASQUERADE=y
-          CONFIG_NETFILTER_XTABLES=y
-          CONFIG_NETFILTER_XT_MARK=y
-          CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
-          CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y
-          CONFIG_NETFILTER_XT_MATCH_IPVS=y
-          CONFIG_NF_NAT_FTP=y
-          CONFIG_NF_NAT_TFTP=y
-
-          # ----- IPVS for kube/docker networking extras -----
-          CONFIG_IP_VS=y
-          CONFIG_IP_VS_PROTO_TCP=y
-          CONFIG_IP_VS_PROTO_UDP=y
-          CONFIG_IP_VS_RR=y
-          CONFIG_IP_VS_NFCT=y
-          EOF
-
-      - name: Prepare defconfig and merge Docker config
-        working-directory: kernel
-        run: |
-          set -eux
-          make O="${OUTDIR}" ARCH=arm64 "${DEVICE}_defconfig"
-          # merge_config.sh is in scripts/kconfig/
-          bash scripts/kconfig/merge_config.sh -m -O "${OUTDIR}" "${OUTDIR}/.config" docker.config
-          # resolve any deps to final config
-          make O="${OUTDIR}" ARCH=arm64 olddefconfig
-          cp "${OUTDIR}/.config" "${OUTDIR}/.config.after-docker"
-
-      - name: Verify container compatibility with Moby check-config
-        working-directory: kernel
-        run: |
-          set -eux
-          curl -L --retry 5 -o check-config.sh \
-            "https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh"
-          bash check-config.sh "${OUTDIR}/.config.after-docker" | tee "${OUTDIR}/docker-config-report.txt"
-
-      - name: Setup Proton-Clang toolchain
-        working-directory: kernel
-        run: |
-          set -eux
-          mkdir -p ../proton-clang
-          wget -q "https://github.com/kdrag0n/proton-clang/archive/refs/tags/${{ github.event.inputs.clang_tag }}.zip" -O ../proton-clang.zip
-          unzip -q ../proton-clang.zip -d ../proton-clang
-          TOOLCHAIN_DIR="$(echo ../proton-clang/proton-clang-*)"
-          echo "TOOLCHAIN_DIR=${TOOLCHAIN_DIR}"
-          echo "TOOLCHAIN_DIR=${TOOLCHAIN_DIR}" >> $GITHUB_ENV
-
-      - name: Build kernel (Image/Image.gz-dtb)
-        working-directory: kernel
-        env:
-          PATH: "${{ env.TOOLCHAIN_DIR }}/bin:${{ github.path }}:${{ env.PATH }}"
-        run: |
-          set -eux
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CC=clang
-          export LD=ld.lld
-          export LLVM=1
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-          make O="${OUTDIR}" -j"$(nproc)" ARCH=arm64
-
-          ls -l "${OUTDIR}/arch/arm64/boot" || true
-
-      - name: Archive build outputs
-        if: always()
-        uses: actions/upload-artifact@v4
+      # ---- 发布到 GitHub Release（tag=branch+timestamp）----
+      - name: Create Release & Upload asset
+        uses: ncipollo/release-action@v1
         with:
-          name: lmi-docker-kernel-outputs
-          path: |
-            kernel/${{ env.OUTDIR }}/.config
-            kernel/${{ env.OUTDIR }}/.config.after-docker
-            kernel/${{ env.OUTDIR }}/docker-config-report.txt
-            kernel/${{ env.OUTDIR }}/arch/arm64/boot/Image
-            kernel/${{ env.OUTDIR }}/arch/arm64/boot/Image.gz
-            kernel/${{ env.OUTDIR }}/arch/arm64/boot/Image.gz-dtb
-            kernel/${{ env.OUTDIR }}/arch/arm64/boot/dts/**/*.dtb
-            kernel/${{ env.OUTDIR }}/arch/arm64/boot/dtbo.img
-            kernel/docker.config
-            cgroup.patch
-            xt_qtaguid.patch
+          tag: ${{ steps.mkzip.outputs.pkg }}
+          name: ${{ steps.mkzip.outputs.pkg }}
+          body: |
+            ROM: AOSP / crDroid
+            Branch: ${{ github.event.inputs.branch || github.ref_name }}
+            Package: ${{ steps.mkzip.outputs.pkg }}.zip
+            Image placed at zip root; packaged with AnyKernel3 (store-only).
+            Built & packaged by GitHub Actions.
+          artifacts: ${{ steps.mkzip.outputs.pkg }}.zip
+          allowUpdates: true
