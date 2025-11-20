@@ -1,14 +1,12 @@
-name: Build Kernel (AOSP/crDroid) → AnyKernel3 (store-only) → Release
+name: Build lmi Kernel → AnyKernel3 (deflate) → Release
 
 on:
   workflow_dispatch:
     inputs:
-      defconfig:
-        description: "内核 defconfig（例如 vendor/mydevice_defconfig）"
-        required: true
+      # 可选：指定构建分支；不填则自动探测远端默认分支
       branch:
-        description: "ROM/AOSP 分支（例如 crdroid-15.x；用于包名/tag）"
-        required: true
+        description: "要构建的内核源码分支（留空则使用远端默认分支）"
+        required: false
   push:
     branches:
       - "*"
@@ -20,19 +18,24 @@ env:
   ARCH: arm64
   SUBARCH: arm64
   THREADS_DEFAULT: 8
+  KERNEL_REPO: https://github.com/ApartTUSITU/kernel_xiaomi_sm8250_mod
   # 固定 Proton-Clang 版本（可按需升级）
   CLANG_URL: https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.tar.gz
   CLANG_DIR: toolchains/proton-clang
   ANYKERNEL3_REPO: https://github.com/osm0sis/AnyKernel3.git
+  # 固定 defconfig 为 lmi
+  DEFCONFIG_PATH: arch/arm64/configs/lmi_defconfig
 
 jobs:
   build-package-release:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Prepare workspace
+        run: |
+          mkdir -p workspace
+          echo "Workspace ready: ${PWD}/workspace"
 
-      # ---- 安装依赖（必须在任何构建/脚本之前） ----
+      # ---- 安装依赖（必须首先执行）----
       - name: Install build deps
         run: |
           sudo apt-get update
@@ -41,7 +44,35 @@ jobs:
             coreutils util-linux \
             bc bison flex libssl-dev \
             libelf-dev dwarves pkg-config zstd \
-            zip unzip python3 rsync ccache
+            zip unzip python3 rsync ccache git curl tar
+
+      # ---- 克隆内核源码（按输入或探测远端默认分支）----
+      - name: Clone kernel source (latest branch if not provided)
+        id: kernel_clone
+        run: |
+          set -e
+          cd workspace
+
+          REPO="${KERNEL_REPO}"
+          USER_BRANCH="${{ github.event.inputs.branch }}"
+
+          if [ -n "${USER_BRANCH}" ]; then
+            echo "Using user-provided branch: ${USER_BRANCH}"
+            git clone --depth=1 --branch "${USER_BRANCH}" "${REPO}" kernel_src
+            echo "branch=${USER_BRANCH}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Detecting remote default branch..."
+            DEFAULT_BRANCH="$(git ls-remote --symref "${REPO}" HEAD | awk '/^ref:/ {print $2}' | awk -F'/' '{print $NF}')"
+            if [ -z "${DEFAULT_BRANCH}" ]; then
+              echo "::error::Failed to detect default branch of ${REPO}"
+              exit 1
+            fi
+            echo "Default branch detected: ${DEFAULT_BRANCH}"
+            git clone --depth=1 --branch "${DEFAULT_BRANCH}" "${REPO}" kernel_src
+            echo "branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Kernel source cloned to: ${PWD}/kernel_src"
 
       # ---- 获取 Proton-Clang 并加入 PATH ----
       - name: Fetch Proton-Clang (20210522) & setup PATH
@@ -50,7 +81,7 @@ jobs:
           curl -L "${CLANG_URL}" | tar -xz --strip-components=1 -C "${CLANG_DIR}"
           echo "${PWD}/${CLANG_DIR}/bin" >> "$GITHUB_PATH"
 
-      # ---- 导出环境变量（遵循 Proton-Clang README 建议） ----
+      # ---- 导出环境变量（遵循 Proton-Clang README 建议）----
       - name: Export env for LLVM/Clang build
         run: |
           {
@@ -64,46 +95,46 @@ jobs:
           } >> "$GITHUB_ENV"
 
       # ---- 清理 & defconfig ----
-      - name: Kernel clean
+      - name: Kernel clean & defconfig (lmi)
         run: |
+          set -eux
+          cd workspace/kernel_src
           make O=out ARCH=${ARCH} clean || true
           make O=out ARCH=${ARCH} mrproper || true
 
-      - name: Kernel defconfig
-        run: |
-          DEFCONFIG="${{ github.event.inputs.defconfig }}"
-          if [ -z "${DEFCONFIG}" ]; then
-            echo "No defconfig provided via workflow_dispatch; please set inputs.defconfig"
+          if [ ! -f "${DEFCONFIG_PATH}" ]; then
+            echo "::error::DEFCONFIG not found at ${DEFCONFIG_PATH}"
             exit 1
           fi
+
           make O=out ARCH=${ARCH} \
             CC=${CC} LD=${LD} LLVM=${LLVM} \
             CROSS_COMPILE=${CROSS_COMPILE} \
             CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32} \
-            "${DEFCONFIG}"
+            "${DEFCONFIG_PATH}"
 
       # ---- 构建内核 ----
       - name: Build kernel
         run: |
+          set -eux
+          cd workspace/kernel_src
           JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo ${THREADS_DEFAULT})"
           make -j"${JOBS}" O=out ARCH=${ARCH} \
             CC=${CC} LD=${LD} LLVM=${LLVM} \
             CROSS_COMPILE=${CROSS_COMPILE} \
             CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32}
 
-      # ---- 查找生成的镜像（支持多常见命名）----
+      # ---- 查找生成的镜像（常见命名）----
       - name: Locate built image
         id: findimg
         run: |
           set -e
+          cd workspace/kernel_src
           CANDIDATES=(
-            "out/arch/arm64/boot/Image"
-            "out/arch/arm64/boot/Image.gz"
             "out/arch/arm64/boot/Image.gz-dtb"
+            "out/arch/arm64/boot/Image.gz"
             "out/arch/arm64/boot/Image-dtb"
-            "arch/arm64/boot/Image"
-            "arch/arm64/boot/Image.gz"
-            "arch/arm64/boot/Image.gz-dtb"
+            "out/arch/arm64/boot/Image"
           )
           for f in "${CANDIDATES[@]}"; do
             if [ -f "$f" ]; then
@@ -112,36 +143,46 @@ jobs:
               exit 0
             fi
           done
-          echo "::error::未找到内核镜像（Image*/Image.gz*/Image.gz-dtb 等）。请检查构建产物与 defconfig。"
+          echo "::error::未找到内核镜像（Image/Image.gz/Image.gz-dtb 等）。请检查构建配置与产物。"
           exit 1
 
-      # ---- 获取 AnyKernel3 模板并调整 ----
-      - name: Clone AnyKernel3
+      # ---- 获取 AnyKernel3 模板；不开启设备校验 ----
+      - name: Clone AnyKernel3 & disable device check
         run: |
+          set -eux
+          cd workspace
           git clone --depth=1 "${ANYKERNEL3_REPO}" ak3
-          # 关闭设备检查以适配通用 AOSP/crDroid；如需开启，后续可按机型改写
+
+          # 不开启设备校验
           sed -i "s/^do.devicecheck=.*/do.devicecheck=0/" ak3/anykernel.sh
-          # 显示字符串（便于区分构建来源）
-          BRANCH="${{ github.event.inputs.branch || github.ref_name }}"
+          # 移除可能存在的 device.nameX 行（保持通用）
+          sed -i '/^device.name[0-9]\+=/d' ak3/anykernel.sh
+
+          # 展示字符串，包含 branch 与日期
+          BRANCH="${{ steps.kernel_clone.outputs.branch }}"
           sed -i "s/^kernel.string=.*/kernel.string=${BRANCH} $(date +%Y-%m-%d)/" ak3/anykernel.sh
 
       # ---- 将镜像放在包根目录 & 可选复制模块 ----
       - name: Prepare AK3 payload (image at zip root)
         run: |
-          cp "${{ steps.findimg.outputs.image }}" ak3/
-          # 若存在内核模块，按 AK3 约定放入 modules 目录（可选）
-          if [ -d "out/lib/modules" ]; then
-            rsync -a out/lib/modules/ ak3/modules/system/lib/modules/
+          set -eux
+          cd workspace
+          cp "kernel_src/${{ steps.findimg.outputs.image }}" ak3/
+          # 如有模块，按 AK3 约定复制（可选）
+          if [ -d "kernel_src/out/lib/modules" ]; then
+            rsync -a kernel_src/out/lib/modules/ ak3/modules/system/lib/modules/
           fi
 
-      # ---- 以 store-only 方式打包（不压缩）----
-      - name: Make flashable zip (zip -0 store-only)
+      # ---- 正常压缩打包（deflate，-9 最大压缩）----
+      - name: Make flashable zip (zip -9 deflate)
         id: mkzip
         run: |
-          BRANCH="${{ github.event.inputs.branch || github.ref_name }}"
+          set -eux
+          cd workspace
+          BRANCH="${{ steps.kernel_clone.outputs.branch }}"
           TS="$(date +%Y%m%d-%H%M%S)"
           PKG="${BRANCH}-${TS}"
-          (cd ak3 && zip -0 -r "../${PKG}.zip" .)
+          (cd ak3 && zip -9 -r "../${PKG}.zip" .)
           echo "pkg=${PKG}" >> "$GITHUB_OUTPUT"
           ls -lh "${PKG}.zip"
 
@@ -152,10 +193,11 @@ jobs:
           tag: ${{ steps.mkzip.outputs.pkg }}
           name: ${{ steps.mkzip.outputs.pkg }}
           body: |
+            Device: lmi
             ROM: AOSP / crDroid
-            Branch: ${{ github.event.inputs.branch || github.ref_name }}
+            Branch: ${{ steps.kernel_clone.outputs.branch }}
             Package: ${{ steps.mkzip.outputs.pkg }}.zip
-            Image placed at zip root; packaged with AnyKernel3 (store-only).
+            Image placed at zip root; packaged with AnyKernel3 (deflate, -9).
             Built & packaged by GitHub Actions.
-          artifacts: ${{ steps.mkzip.outputs.pkg }}.zip
+          artifacts: workspace/${{ steps.mkzip.outputs.pkg }}.zip
           allowUpdates: true
