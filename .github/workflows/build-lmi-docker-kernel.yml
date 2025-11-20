@@ -201,30 +201,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # 拉取 AnyKernel3
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
           cd ak3
 
-          # 为了 JSON 安全，从 inputs 读入后解码
-          AK3_STR=${{ toJSON(inputs.ak3_kernel_string) }}
-          DEV_STR=${{ toJSON(inputs.device) }}
-          SUP_STR=${{ toJSON(inputs.ak3_supported_versions) }}
+          # 将 GitHub Actions 的 inputs 赋值到原始字符串（JSON 安全：通过 toJSON）
+          AK3_RAW=${{ toJSON(inputs.ak3_kernel_string) }}
+          DEV_RAW=${{ toJSON(inputs.device) }}
+          SUP_RAW=${{ toJSON(inputs.ak3_supported_versions) }}
 
-          AK3_STR=$(python3 - <<'PY' "${AK3_STR}"
-import json,sys
-print(json.loads(sys.argv[1]))
-PY
-)
-          DEV_STR=$(python3 - <<'PY' "${DEV_STR}"
-import json,sys
-print(json.loads(sys.argv[1]))
-PY
-)
-          SUP_STR=$(python3 - <<'PY' "${SUP_STR}"
-import json,sys
-print(json.loads(sys.argv[1]))
-PY
-)
+          # 使用 python3 -c 从环境变量中安全解码 JSON 字符串
+          export AK3_RAW DEV_RAW SUP_RAW
+          AK3_STR="$(python3 -c 'import os,json; print(json.loads(os.environ["AK3_RAW"]))')"
+          DEV_STR="$(python3 -c 'import os,json; print(json.loads(os.environ["DEV_RAW"]))')"
+          SUP_STR="$(python3 -c 'import os,json; print(json.loads(os.environ["SUP_RAW"]))')"
 
+          # 更新 anykernel.sh 中的显示字段
           awk -v kstr="$AK3_STR" -v dev="$DEV_STR" -v sup="$SUP_STR" '
             BEGIN{FS=OFS="="}
             /^kernel.string=/      { $0="kernel.string="kstr; print; next }
@@ -233,6 +226,7 @@ PY
             { print }
           ' anykernel.sh > anykernel.sh.tmp && mv anykernel.sh.tmp anykernel.sh
 
+          # 收集内核镜像并打包
           mkdir -p kernel
           if [ -f ../kernel_src/${OUT}/arch/arm64/boot/Image.gz-dtb ]; then
             cp ../kernel_src/${OUT}/arch/arm64/boot/Image.gz-dtb kernel/
@@ -245,6 +239,7 @@ PY
           ZIP="../Docker-ready-kernel-${DEV_STR}-${{ inputs.branch }}.zip"
           zip -r9 "$ZIP" .
           echo "AK3 zip: $ZIP"
+
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
