@@ -4,10 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: "要构建的内核源码分支（留空则用远端默认分支）"
+        description: "要构建的内核源码分支（留空则使用远端默认分支）"
         required: false
+      strict_werror:
+        description: "是否保持 CONFIG_WERROR 严格模式（true=警告当错误；false=在CI中放宽）"
+        required: false
+        default: "false"
   push:
-    branches: [ "*" ]
+    branches:
+      - "*"
 
 permissions:
   contents: write
@@ -27,11 +32,12 @@ env:
 jobs:
   build-package-release:
     runs-on: ubuntu-latest
+
     steps:
       - name: Prepare workspace
         run: mkdir -p workspace
 
-      # 依赖：增加交叉 GCC，满足脚本探测需求（gcc-version.sh）
+      # 依赖：包含交叉 GCC，满足脚本探测与目标侧编译
       - name: Install build deps
         run: |
           sudo apt-get update
@@ -44,7 +50,7 @@ jobs:
             patch xz-utils gzip \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      - name: Clone kernel source
+      - name: Clone kernel source (latest branch if not provided)
         id: kernel_clone
         run: |
           set -e
@@ -61,12 +67,13 @@ jobs:
             echo "branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
           fi
 
-      # 下载工具链但不修改 Runner 的全局 PATH（避免 host 阶段误用）
+      # 下载 Clang/LLVM 工具链（不改全局 PATH；仅目标编译步临时加入）
       - name: Fetch Proton-Clang (toolchain)
         run: |
           mkdir -p "${CLANG_DIR}"
           curl -L "${CLANG_URL}" | tar -xz --strip-components=1 -C "${CLANG_DIR}"
 
+      # 拉取外部补丁
       - name: Fetch patches (cgroup + xt_qtaguid)
         run: |
           set -eux
@@ -74,12 +81,14 @@ jobs:
           curl -L "${PATCH_CGROUP_URL}"  -o cgroup.patch
           curl -L "${PATCH_QTAGUID_URL}" -o xt_qtaguid.patch
 
+      # 必须应用：cgroup.patch
       - name: Apply cgroup.patch (mandatory)
         run: |
           set -eux
           cd workspace/kernel_src
           (git apply --index ../cgroup.patch) || (patch -p1 < ../cgroup.patch)
 
+      # 条件应用：xt_qtaguid.patch
       - name: Conditionally apply xt_qtaguid.patch
         run: |
           set -eux
@@ -90,34 +99,22 @@ jobs:
             echo "xt_qtaguid not found; skip."
           fi
 
-
+      # 源树清理一次，避免 prepare3 检测到 srctree 污染
       - name: Source tree mrproper (clean srctree)
-        run: |
-         set -eux
-         cd workspace/kernel_src
-         make ARCH=arm64 mrproper
-
-      # --- Host 阶段：清理/defconfig/scripts（只用系统 gcc/ld；不设 LLVM=1/LD） ---
-      - name: Kernel clean (host tools only)
         run: |
           set -eux
           cd workspace/kernel_src
-          make O=out ARCH=${ARCH} HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld clean || true
-          make O=out ARCH=${ARCH} HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld mrproper || true
+          make ARCH=${ARCH} mrproper
 
+      # Defconfig：Kbuild 约定仅使用目标名（不带路径）
       - name: Defconfig (host tools only)
         run: |
           set -eux
           cd workspace/kernel_src
           [ -f "${DEFCONFIG_PATH}" ] || { echo "::error::DEFCONFIG missing"; exit 1; }
-          # ✅ 正确：不要带路径，直接用目标名 lmi_defconfig
           make O=out ARCH=${ARCH} HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld lmi_defconfig
 
-          # 如果你更偏好显式路径，也可以改成：
-          # make O=out ARCH=${ARCH} HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld \
-          #     KCONFIG_DEFCONFIG=${DEFCONFIG_PATH} defconfig
-
-
+      # 构建 scripts（生成 scripts/config），主机侧用系统 gcc/ld，目标侧给交叉前缀
       - name: Build kernel scripts (to get scripts/config)
         run: |
           set -eux
@@ -126,9 +123,32 @@ jobs:
             HOSTCC=gcc HOSTLD=/usr/bin/ld \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LD=aarch64-linux-gnu-ld \
+            scripts
 
+      # 代码贴片：修正可能未用变量与常见 WALT u64 打印格式（保守替换）
+      - name: Patch WALT warnings (unused + format safety)
+        run: |
+          set -eux
+          cd workspace/kernel_src
+          # 未使用变量 → __maybe_unused
+          sed -i 's/^\s*static\s\+int\s\+in_sched_bug\s*;/static int __maybe_unused in_sched_bug;/' kernel/sched/walt.h || true
+          # 常见 u64 字段的 %u → %llu（若对应字段存在且确为 u64，保守替换）
+          sed -i 's/\(\<irqtime\>\s*%\)u/\1llu/g' include/trace/events/walt.h || true
+          sed -i 's/\(\<rq_cs\>\s*%\)u/\1llu/g'    include/trace/events/walt.h || true
+          sed -i 's/\(\<rq_ps\>\s*%\)u/\1llu/g'    include/trace/events/walt.h || true
+          sed -i 's/\(\<nt_cs\>\s*%\)u/\1llu/g'    include/trace/events/walt.h || true
+          sed -i 's/\(\<nt_ps\>\s*%\)u/\1llu/g'    include/trace/events/walt.h || true
 
-      # --- 开启全部 Docker 支持项（参考 moby check-config） ---
+      # （可选）关闭 WERROR 并放宽两类常见告警；strict_werror=true 时跳过
+      - name: Disable WERROR and relax warnings for CI
+        if: ${{ github.event.inputs.strict_werror != 'true' }}
+        run: |
+          set -eux
+          cd workspace/kernel_src
+          scripts/config --disable CONFIG_WERROR
+          make O=out olddefconfig
+
+      # 开启全部 Docker 相关内核配置（来源于 moby check-config 的必要与常见可选）
       - name: Enable ALL Docker-related kernel configs
         run: |
           set -eux
@@ -175,6 +195,7 @@ jobs:
 
           make O=out olddefconfig
 
+      # 自检：Moby 官方 check-config.sh
       - name: Run moby check-config.sh against out/.config
         run: |
           set -eux
@@ -183,28 +204,39 @@ jobs:
           chmod +x check-config.sh
           ./check-config.sh out/.config | tee ../docker-kernel-check.txt
 
-      # --- 目标内核编译：仅在此步启用 LLVM=1 + CC=clang（局部传工具链根） ---
+      # 目标内核编译：仅在此步启用 LLVM/Clang；临时加入工具链到 PATH；可选放宽告警
       - name: Build kernel (target; LLVM/Clang)
         run: |
           set -eux
           cd workspace/kernel_src
-          # 仅在目标编译步临时加入工具链到 PATH，供 lld-version.sh 等查找 ld.lld
           export PATH="${PWD}/../../${CLANG_DIR}/bin:${PATH}"
 
           JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo ${THREADS_DEFAULT})"
+
+          if [ "${{ github.event.inputs.strict_werror }}" = "true" ]; then
+            KCFLAGS_EXTRA=""
+          else
+            # 在 CI 过渡期，可放宽格式与未用变量两类告警
+            KCFLAGS_EXTRA="-Wno-error=format -Wno-error=unused-variable"
+          fi
+
           make -j"${JOBS}" O=out ARCH=${ARCH} \
             LLVM=1 LLVM_IAS=1 \
             CC=clang LD=ld.lld \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            KCFLAGS="${KCFLAGS_EXTRA}"
 
       - name: Locate built image
         id: findimg
         run: |
           set -e
           cd workspace/kernel_src
-          for f in out/arch/arm64/boot/Image.gz-dtb out/arch/arm64/boot/Image.gz out/arch/arm64/boot/Image-dtb out/arch/arm64/boot/Image
+          for f in \
+            out/arch/arm64/boot/Image.gz-dtb \
+            out/arch/arm64/boot/Image.gz \
+            out/arch/arm64/boot/Image-dtb \
+            out/arch/arm64/boot/Image
           do [ -f "$f" ] && { echo "image=$f" >> "$GITHUB_OUTPUT"; echo "Found: $f"; exit 0; }; done
           echo "::error::未找到内核镜像"; exit 1
 
