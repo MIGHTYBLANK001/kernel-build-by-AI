@@ -37,7 +37,6 @@ jobs:
       - name: Prepare workspace
         run: mkdir -p workspace
 
-      # 依赖：包含交叉 GCC，满足脚本探测与目标侧编译
       - name: Install build deps
         run: |
           sudo apt-get update
@@ -67,13 +66,11 @@ jobs:
             echo "branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
           fi
 
-      # 下载 Clang/LLVM 工具链（不改全局 PATH；仅目标编译步临时加入）
       - name: Fetch Proton-Clang (toolchain)
         run: |
           mkdir -p "${CLANG_DIR}"
           curl -L "${CLANG_URL}" | tar -xz --strip-components=1 -C "${CLANG_DIR}"
 
-      # 拉取外部补丁
       - name: Fetch patches (cgroup + xt_qtaguid)
         run: |
           set -eux
@@ -81,14 +78,12 @@ jobs:
           curl -L "${PATCH_CGROUP_URL}"  -o cgroup.patch
           curl -L "${PATCH_QTAGUID_URL}" -o xt_qtaguid.patch
 
-      # 必须应用：cgroup.patch
       - name: Apply cgroup.patch (mandatory)
         run: |
           set -eux
           cd workspace/kernel_src
           (git apply --index ../cgroup.patch) || (patch -p1 < ../cgroup.patch)
 
-      # 条件应用：xt_qtaguid.patch
       - name: Conditionally apply xt_qtaguid.patch
         run: |
           set -eux
@@ -99,14 +94,12 @@ jobs:
             echo "xt_qtaguid not found; skip."
           fi
 
-      # 源树清理一次，避免 prepare3 检测到 srctree 污染
       - name: Source tree mrproper (clean srctree)
         run: |
           set -eux
           cd workspace/kernel_src
           make ARCH=${ARCH} mrproper
 
-      # Defconfig：Kbuild 约定仅使用目标名（不带路径）
       - name: Defconfig (host tools only)
         run: |
           set -eux
@@ -114,7 +107,6 @@ jobs:
           [ -f "${DEFCONFIG_PATH}" ] || { echo "::error::DEFCONFIG missing"; exit 1; }
           make O=out ARCH=${ARCH} HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld lmi_defconfig
 
-      # 构建 scripts（生成 scripts/config），主机侧用系统 gcc/ld，目标侧给交叉前缀
       - name: Build kernel scripts (to get scripts/config)
         run: |
           set -eux
@@ -125,21 +117,17 @@ jobs:
             LD=aarch64-linux-gnu-ld \
             scripts
 
-      # 代码贴片：修正可能未用变量与常见 WALT u64 打印格式（保守替换）
       - name: Patch WALT warnings (unused + format safety)
         run: |
           set -eux
           cd workspace/kernel_src
-          # 未使用变量 → __maybe_unused
           sed -i 's/^\s*static\s\+int\s\+in_sched_bug\s*;/static int __maybe_unused in_sched_bug;/' kernel/sched/walt.h || true
-          # 常见 u64 字段的 %u → %llu（若对应字段存在且确为 u64，保守替换）
           sed -i 's/\(\<irqtime\>\s*%\)u/\1llu/g' include/trace/events/walt.h || true
           sed -i 's/\(\<rq_cs\>\s*%\)u/\1llu/g'    include/trace/events/walt.h || true
           sed -i 's/\(\<rq_ps\>\s*%\)u/\1llu/g'    include/trace/events/walt.h || true
           sed -i 's/\(\<nt_cs\>\s*%\)u/\1llu/g'    include/trace/events/walt.h || true
           sed -i 's/\(\<nt_ps\>\s*%\)u/\1llu/g'    include/trace/events/walt.h || true
 
-      # （可选）关闭 WERROR 并放宽两类常见告警；strict_werror=true 时跳过
       - name: Disable WERROR and relax warnings for CI
         if: ${{ github.event.inputs.strict_werror != 'true' }}
         run: |
@@ -148,7 +136,6 @@ jobs:
           scripts/config --disable CONFIG_WERROR
           make O=out olddefconfig
 
-      # 开启全部 Docker 相关内核配置（来源于 moby check-config 的必要与常见可选）
       - name: Enable ALL Docker-related kernel configs
         run: |
           set -eux
@@ -156,7 +143,6 @@ jobs:
           enable() { scripts/config --enable "$1" || true; }
           module() { scripts/config --module "$1" || true; }
 
-          # Generally Necessary
           for K in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_IPC_NS CONFIG_UTS_NS CONFIG_USER_NS \
                    CONFIG_KEYS CONFIG_SECCOMP CONFIG_DEVPTS_MULTIPLE_INSTANCES CONFIG_POSIX_MQUEUE \
                    CONFIG_CGROUPS CONFIG_CGROUP_CPUACCT CONFIG_CGROUP_DEVICE CONFIG_CGROUP_FREEZER \
@@ -167,35 +153,29 @@ jobs:
           do enable "$K"; done
           module CONFIG_NETFILTER_XT_MATCH_IPVS
 
-          # Optional Features
           for K in CONFIG_CGROUP_PIDS CONFIG_BLK_CGROUP CONFIG_CGROUP_PERF CONFIG_CGROUP_HUGETLB \
                    CONFIG_NET_CLS_CGROUP CONFIG_CGROUP_NET_PRIO CONFIG_CFS_BANDWIDTH CONFIG_FAIR_GROUP_SCHED CONFIG_RT_GROUP_SCHED \
                    CONFIG_MEMCG_SWAP CONFIG_MEMCG_SWAP_ENABLED CONFIG_MEMCG_KMEM
           do enable "$K"; done
 
-          # Network drivers
           for K in CONFIG_VXLAN CONFIG_MACVLAN CONFIG_IPVLAN CONFIG_DUMMY; do module "$K"; done
 
-          # Encrypted networks / IPsec
           for K in CONFIG_CRYPTO CONFIG_CRYPTO_AEAD CONFIG_CRYPTO_GCM CONFIG_CRYPTO_SEQIV CONFIG_CRYPTO_GHASH CONFIG_XFRM CONFIG_XFRM_USER
           do enable "$K"; done
           for K in CONFIG_XFRM_ALGO CONFIG_INET_ESP CONFIG_INET_XFRM_MODE_TRANSPORT; do module "$K"; done
 
-          # Storage drivers
           enable CONFIG_OVERLAY_FS
           module CONFIG_BLK_DEV_DM
           module CONFIG_DM_THIN_PROVISIONING
           module CONFIG_BTRFS_FS
           module CONFIG_BTRFS_FS_POSIX_ACL
 
-          # Docker 28+ ipset
           module CONFIG_IP_SET
           module CONFIG_IP_SET_HASH_NET
           module CONFIG_NETFILTER_XT_SET
 
           make O=out olddefconfig
 
-      # 自检：Moby 官方 check-config.sh
       - name: Run moby check-config.sh against out/.config
         run: |
           set -eux
@@ -204,11 +184,13 @@ jobs:
           chmod +x check-config.sh
           ./check-config.sh out/.config | tee ../docker-kernel-check.txt
 
-      # 目标内核编译：仅在此步启用 LLVM/Clang；临时加入工具链到 PATH；可选放宽告警
-      - name: Build kernel (target; LLVM/Clang)
+      # 目标内核编译：目标侧用 LLVM/Clang；主机侧强制系统工具链
+      - name: Build kernel (target; LLVM/Clang + host pinned to system)
         run: |
           set -eux
           cd workspace/kernel_src
+
+          # lld-version.sh 通过 PATH 查找 ld.lld，因此仅在此步临时加入工具链路径
           export PATH="${PWD}/../../${CLANG_DIR}/bin:${PATH}"
 
           JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo ${THREADS_DEFAULT})"
@@ -216,7 +198,6 @@ jobs:
           if [ "${{ github.event.inputs.strict_werror }}" = "true" ]; then
             KCFLAGS_EXTRA=""
           else
-            # 在 CI 过渡期，可放宽格式与未用变量两类告警
             KCFLAGS_EXTRA="-Wno-error=format -Wno-error=unused-variable"
           fi
 
@@ -225,6 +206,7 @@ jobs:
             CC=clang LD=ld.lld \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld HOSTAR=ar \
             KCFLAGS="${KCFLAGS_EXTRA}"
 
       - name: Locate built image
