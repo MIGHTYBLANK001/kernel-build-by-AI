@@ -135,43 +135,82 @@ jobs:
             patch -p1 < /tmp/xt_qtaguid.patch || true
             echo "[WARN] xt_qtaguid patch may have failed; continue"
           fi
-
-      - name: Force-enable Docker-required CONFIGs
-        if: ${{ inputs.enable_docker_configs == 'true' }}
+          
+      - name: Force-enable Docker-required CONFIGs (extended)
         shell: bash
         working-directory: kernel_src
         run: |
           set -e
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CC=clang
-          export LD=ld.lld
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export ARCH=arm64 SUBARCH=arm64
+          export CC=clang LD=ld.lld
+          export CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-
+
           CFG="${OUT}/.config"
           SC="./scripts/config"
 
           enable_y() { "${SC}" --file "${CFG}" --enable "$1" || true; }
           enable_m() { "${SC}" --file "${CFG}" --module "$1" || true; }
+          set_str() { "${SC}" --file "${CFG}" --set-str "$1" "$2" || true; }
 
+          # 基础：可读出内核配置/本地版本标识
           enable_y CONFIG_IKCONFIG
           enable_y CONFIG_IKCONFIG_PROC
-          "${SC}" --file "${CFG}" --set-str CONFIG_LOCALVERSION "-docker-ready" || true
+          set_str CONFIG_LOCALVERSION "-docker-ready"
 
-          for K in NAMESPACES UTS_NS IPC_NS PID_NS NET_NS USER_NS; do enable_y CONFIG_${K}; done
-          for K in CGROUPS CGROUP_DEVICE CPUSETS CGROUP_CPUACCT BLK_CGROUP MEMCG CGROUP_PIDS CGROUP FREEZER CGROUP_SCHED CGROUP_WRITEBACK; do enable_y CONFIG_${K}; done
+          # Namespaces / Cgroups 基础（Docker必需）
+          enable_y CONFIG_NAMESPACES
+          enable_y CONFIG_CGROUPS
+          enable_y CONFIG_CGROUP_SCHED
+          enable_y CONFIG_CGROUP_FREEZER
+          enable_y CONFIG_CGROUP_CPUACCT
+          enable_y CONFIG_CPUSETS
+          enable_y CONFIG_MEMCG
+
+          # 你设备当前缺失的项（强制开启）
+          enable_y CONFIG_CGROUP_PIDS
+          enable_y CONFIG_CGROUP_DEVICE
+
+          # OverlayFS 作为存储驱动
           enable_y CONFIG_OVERLAY_FS
-          for K in VETH BRIDGE BRIDGE_NETFILTER NETFILTER NETFILTER_XTABLES NF_CONNTRACK NF_NAT \
-                   IP_NF_IPTABLES IP_NF_FILTER IP_NF_MANGLE IP_NF_RAW IP_NF_SECURITY IP_NF_TARGET_MASQUERADE \
-                   NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_MATCH_CONNTRACK NETFILTER_XT_MATCH_STATE NETFILTER_XT_MATCH_STATISTIC; do
-            enable_y CONFIG_${K}
-          done
-          enable_m CONFIG_IP_SET
-          enable_m CONFIG_IP_SET_HASH_NET
-          enable_m CONFIG_NETFILTER_XT_SET
 
+          # 虚拟网卡 + 桥接
+          enable_y CONFIG_VETH
+          enable_y CONFIG_BRIDGE
+          # 关键：桥接进入 Netfilter（Docker bridge/NAT）
+          enable_y CONFIG_BRIDGE_NETFILTER
+
+          # Netfilter 基础/xtables
+          enable_y CONFIG_NETFILTER
+          enable_y CONFIG_NETFILTER_ADVANCED
+          enable_y CONFIG_NETFILTER_XTABLES
+          enable_y CONFIG_NF_CONNTRACK
+          enable_y CONFIG_NF_NAT
+          enable_y CONFIG_IP_NF_IPTABLES
+          enable_y CONFIG_IP_NF_FILTER
+          enable_y CONFIG_IP_NF_MANGLE
+
+          # NAT/MASQUERADE（Docker 默认依赖）
+          enable_y CONFIG_NETFILTER_XT_NAT
+          enable_y CONFIG_IP_NF_TARGET_MASQUERADE
+          enable_y CONFIG_NF_NAT_MASQUERADE_IPV4
+          enable_y CONFIG_NF_NAT_MASQUERADE_IPV6
+
+          # 常用匹配（addrtype / conntrack / state / statistic）
+          enable_y CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
+          enable_y CONFIG_NETFILTER_XT_MATCH_CONNTRACK
+          enable_y CONFIG_NETFILTER_XT_MATCH_STATE
+          enable_y CONFIG_NETFILTER_XT_MATCH_STATISTIC
+
+          # 其它常见匹配/目标可按需开启（已有则忽略）
+          enable_y CONFIG_NETFILTER_XT_TARGET_REDIRECT
+          enable_y CONFIG_NETFILTER_XT_TARGET_TCPMSS
+          enable_y CONFIG_NETFILTER_XT_TARGET_TPROXY
+
+          # 固化为最终配置
           make LLVM="${LLVM}" O="${OUT}" ARCH="${ARCH}" olddefconfig
-          egrep -i 'CONFIG_(IKCONFIG|LOCALVERSION|NAMESPACES|CGROUP|OVERLAY|VETH|BRIDGE|NETFILTER|IP_SET|XT_SET|NF_|IP_NF_)' "${OUT}/.config" | sort || true
+
+          echo "[INFO] Summary of Docker-critical flags:"
+          zgrep -E 'CONFIG_(NAMESPACES|CGROUP|OVERLAY|VETH|BRIDGE|BRIDGE_NETFILTER|NETFILTER|XTABLES|NF_CONNTRACK|NF_NAT|IP_NF|MASQUERADE|ADDRTYPE|CONNTRACK|STATE|STATISTIC)=' "${CFG}" | sort || true
 
       - name: Validate container compatibility (Moby check-config.sh)
         shell: bash
@@ -195,6 +234,108 @@ jobs:
           export CLANG_TRIPLE=aarch64-linux-gnu-
           make LLVM="${LLVM}" O="${OUT}" -j"$(nproc)"
           ls -la "${OUT}/arch/arm64/boot" || true
+
+      - name: Write local Docker kernel validator
+        shell: bash
+        working-directory: kernel_src
+        run: |
+          cat > .ci/check_docker_kernel.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          CFG="${1:-out/.config}"
+
+          req_flags=(  # 必需项（缺失则失败）
+            NAMESPACES
+            CGROUPS
+            CGROUP_SCHED
+            CGROUP_FREEZER
+            CGROUP_CPUACCT
+            CPUSETS
+            MEMCG
+            CGROUP_PIDS
+            CGROUP_DEVICE
+            OVERLAY_FS
+            VETH
+            BRIDGE
+            BRIDGE_NETFILTER
+            NETFILTER
+            NETFILTER_ADVANCED
+            NETFILTER_XTABLES
+            NF_CONNTRACK
+            NF_NAT
+            IP_NF_IPTABLES
+            IP_NF_FILTER
+            IP_NF_MANGLE
+            NETFILTER_XT_NAT
+            IP_NF_TARGET_MASQUERADE
+            NF_NAT_MASQUERADE_IPV4
+            NETFILTER_XT_MATCH_ADDRTYPE
+            NETFILTER_XT_MATCH_CONNTRACK
+            NETFILTER_XT_MATCH_STATE
+            NETFILTER_XT_MATCH_STATISTIC
+          )
+
+          opt_flags=(  # 可选项（建议开启）
+            NF_NAT_MASQUERADE_IPV6
+            NETFILTER_XT_TARGET_REDIRECT
+            NETFILTER_XT_TARGET_TCPMSS
+            NETFILTER_XT_TARGET_TPROXY
+          )
+
+          report="docker-kernel-check.txt"
+          : > "$report"
+
+          echo "Kernel CONFIG check for Docker @ $(date)" >> "$report"
+          echo "Config file: $CFG" >> "$report"
+          echo >> "$report"
+
+          missing=0
+          echo "== Generally Necessary ==" >> "$report"
+          for f in "${req_flags[@]}"; do
+            if zgrep -q "CONFIG_${f}=[ym]" "$CFG"; then
+              printf "  - CONFIG_%s: OK\n" "$f" >> "$report"
+            else
+              printf "  - CONFIG_%s: MISSING\n" "$f" >> "$report"
+              missing=$((missing+1))
+            fi
+          done
+
+          echo >> "$report"
+          echo "== Optional / Recommended ==" >> "$report"
+          for f in "${opt_flags[@]}"; do
+            if zgrep -q "CONFIG_${f}=[ym]" "$CFG"; then
+              printf "  - CONFIG_%s: OK\n" "$f" >> "$report"
+            else
+              printf "  - CONFIG_%s: (optional) missing\n" "$f" >> "$report"
+            fi
+          done
+
+          echo >> "$report"
+          echo "Missing count (required): $missing" >> "$report"
+
+          # 缺关键项则失败
+          if [ "$missing" -gt 0 ]; then
+            echo "[ERROR] Required kernel flags missing: $missing"
+            exit 2
+          fi
+          SH
+          chmod +x .ci/check_docker_kernel.sh
+
+      - name: Validate Docker kernel flags (local)
+        shell: bash
+        working-directory: kernel_src
+        run: |
+          set -e
+          .ci/check_docker_kernel.sh "${OUT}/.config"
+          echo "[INFO] Validation PASSED"
+
+      - name: Upload Docker kernel validation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-kernel-check
+          path: kernel_src/docker-kernel-check.txt
+
+
 
       - name: Pack AnyKernel3 zip
         shell: bash
