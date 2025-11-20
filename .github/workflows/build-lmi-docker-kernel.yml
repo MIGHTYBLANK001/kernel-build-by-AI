@@ -32,7 +32,6 @@ on:
         required: false
         default: ""
 
-# Make sure we have permission to create releases and upload artifacts
 permissions:
   contents: write
 
@@ -197,8 +196,15 @@ jobs:
           make LLVM="${LLVM}" O="${OUT}" -j"$(nproc)"
           ls -la "${OUT}/arch/arm64/boot" || true
 
+      # -------- 打包片段（已修复：通过 env 传入 inputs，python3 -c 解码 JSON）--------
       - name: Fetch AnyKernel3 & pack zip
         shell: bash
+        env:
+          AK3_RAW: ${{ toJSON(inputs.ak3_kernel_string) }}
+          DEV_RAW: ${{ toJSON(inputs.device) }}
+          SUP_RAW: ${{ toJSON(inputs.ak3_supported_versions) }}
+          BRANCH_IN: ${{ inputs.branch }}
+          OUT_DIR: ${{ env.OUT }}
         run: |
           set -euo pipefail
 
@@ -206,18 +212,12 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
           cd ak3
 
-          # 将 GitHub Actions 的 inputs 赋值到原始字符串（JSON 安全：通过 toJSON）
-          AK3_RAW=${{ toJSON(inputs.ak3_kernel_string) }}
-          DEV_RAW=${{ toJSON(inputs.device) }}
-          SUP_RAW=${{ toJSON(inputs.ak3_supported_versions) }}
+          # 安全解码 JSON（避免 heredoc/转义问题）
+          AK3_STR="$(python3 -c 'import os, json; print(json.loads(os.environ["AK3_RAW"]))')"
+          DEV_STR="$(python3 -c 'import os, json; print(json.loads(os.environ["DEV_RAW"]))')"
+          SUP_STR="$(python3 -c 'import os, json; print(json.loads(os.environ["SUP_RAW"]))')"
 
-          # 使用 python3 -c 从环境变量中安全解码 JSON 字符串
-          export AK3_RAW DEV_RAW SUP_RAW
-          AK3_STR="$(python3 -c 'import os,json; print(json.loads(os.environ["AK3_RAW"]))')"
-          DEV_STR="$(python3 -c 'import os,json; print(json.loads(os.environ["DEV_RAW"]))')"
-          SUP_STR="$(python3 -c 'import os,json; print(json.loads(os.environ["SUP_RAW"]))')"
-
-          # 更新 anykernel.sh 中的显示字段
+          # 修改 anykernel.sh 配置项
           awk -v kstr="$AK3_STR" -v dev="$DEV_STR" -v sup="$SUP_STR" '
             BEGIN{FS=OFS="="}
             /^kernel.string=/      { $0="kernel.string="kstr; print; next }
@@ -228,18 +228,18 @@ jobs:
 
           # 收集内核镜像并打包
           mkdir -p kernel
-          if [ -f ../kernel_src/${OUT}/arch/arm64/boot/Image.gz-dtb ]; then
-            cp ../kernel_src/${OUT}/arch/arm64/boot/Image.gz-dtb kernel/
-          elif [ -f ../kernel_src/${OUT}/arch/arm64/boot/Image.gz ]; then
-            cp ../kernel_src/${OUT}/arch/arm64/boot/Image.gz kernel/
+          if [ -f "../kernel_src/${OUT_DIR}/arch/arm64/boot/Image.gz-dtb" ]; then
+            cp "../kernel_src/${OUT_DIR}/arch/arm64/boot/Image.gz-dtb" kernel/
+          elif [ -f "../kernel_src/${OUT_DIR}/arch/arm64/boot/Image.gz" ]; then
+            cp "../kernel_src/${OUT_DIR}/arch/arm64/boot/Image.gz" kernel/
           else
             echo "No Image.gz[-dtb] found!" && exit 1
           fi
 
-          ZIP="../Docker-ready-kernel-${DEV_STR}-${{ inputs.branch }}.zip"
+          ZIP="../Docker-ready-kernel-${DEV_STR}-${BRANCH_IN}.zip"
           zip -r9 "$ZIP" .
+          [ -f "$ZIP" ] || { echo "ZIP not created"; exit 1; }
           echo "AK3 zip: $ZIP"
-
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -263,16 +263,16 @@ jobs:
           fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "name=Docker-ready kernel for lmi (${TAG})" >> "$GITHUB_OUTPUT"
-          cat << 'EOF' >> "$GITHUB_OUTPUT"
-body= ## Docker-ready kernel for lmi — v3.7.2
- - Repo: ${{ inputs.repo_url }}
- - Branch: ${{ inputs.branch }}
- - Defconfig: lmi_defconfig
- - LLVM tools hardened + Clang AArch64 target fixed
- - Includes Docker CONFIGs (namespaces/cgroups/overlayfs/netfilter/ipset/veth/bridge)
- - xt_qtaguid patch: auto-detect path; non-fatal if fails
- - AK3 packing fixed (shell:bash + JSON-safe string injection)
-EOF
+          {
+            echo "body= ## Docker-ready kernel for lmi — v3.7.2"
+            echo " - Repo: ${{ inputs.repo_url }}"
+            echo " - Branch: ${{ inputs.branch }}"
+            echo " - Defconfig: lmi_defconfig"
+            echo " - LLVM tools hardened + Clang AArch64 target fixed"
+            echo " - Includes Docker CONFIGs (namespaces/cgroups/overlayfs/netfilter/ipset/veth/bridge)"
+            echo " - xt_qtaguid patch: auto-detect path; non-fatal if fails"
+            echo " - AK3 packing fixed (shell:bash + JSON-safe string injection)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create Release and upload assets
         uses: softprops/action-gh-release@v2
