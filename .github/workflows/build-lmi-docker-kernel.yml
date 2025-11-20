@@ -110,11 +110,16 @@ jobs:
           # make O=out ARCH=${ARCH} HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld \
           #     KCONFIG_DEFCONFIG=${DEFCONFIG_PATH} defconfig
 
+
       - name: Build kernel scripts (to get scripts/config)
         run: |
           set -eux
           cd workspace/kernel_src
-          make O=out ARCH=${ARCH} HOSTCC=gcc HOSTLD=/usr/bin/ld scripts
+          make O=out ARCH=${ARCH} \
+            HOSTCC=gcc HOSTLD=/usr/bin/ld \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LD=aarch64-linux-gnu-ld \
+            scripts
 
       # --- 开启全部 Docker 支持项（参考 moby check-config） ---
       - name: Enable ALL Docker-related kernel configs
@@ -177,11 +182,12 @@ jobs:
           set -eux
           cd workspace/kernel_src
           JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo ${THREADS_DEFAULT})"
-          make -j"${JOBS}" O=out ARCH=${ARCH} \
+          make -j"${JOBS}" O=out ARCH=arm64 \
             LLVM="${PWD}/../../${CLANG_DIR}/bin/" \
             CC=clang LD=ld.lld \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
 
       - name: Locate built image
         id: findimg
