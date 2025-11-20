@@ -1,4 +1,4 @@
-name: Build Docker-ready kernel (SM8250/lmi) - v3.7.2
+name: Build Docker-ready kernel (SM8250/lmi) - v3.7.3
 
 on:
   workflow_dispatch:
@@ -52,6 +52,7 @@ jobs:
       KBUILD_BUILD_USER: "gh-actions"
       KBUILD_BUILD_HOST: "ubuntu"
       TZ: "Asia/Shanghai"
+      DEFCONFIG: lmi_defconfig  # 明确使用 lmi_defconfig
 
     steps:
       - name: Checkout kit repo (to load workflow)
@@ -93,19 +94,44 @@ jobs:
             which "$t" && "$t" --version || true
           done
 
+      # ========= 你提供的片段（已对齐路径/变量）：开启 LXC 和 Docker 配置 =========
+      - name: 开启lxc和docker配置
+        shell: bash
+        run: |
+          set -e
+          cd "${GITHUB_WORKSPACE}/kernel_src"
+          wget -q https://github.com/Flyme66/lxc-docker/releases/download/Lxc5.0/add-lxc-docker-custom.sh
+          chmod 755 add-lxc-docker-custom.sh
+          # 修改 defconfig 文件（例如 lmi_defconfig）
+          ./add-lxc-docker-custom.sh "arch/arm64/configs/${DEFCONFIG}"
+          # 额外关闭 Android 粘性网络限制（某些容器场景需要）
+          echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> "arch/arm64/configs/${DEFCONFIG}"
+
+      # ========= 你提供的片段（已对齐路径/变量）：添加 runc 补丁 =========
+      - name: 添加runc补丁
+        shell: bash
+        run: |
+          set -e
+          cd "${GITHUB_WORKSPACE}/kernel_src"
+          wget -q https://github.com/Flyme66/lxc-docker/releases/download/Lxc5.0/runcpatch.sh
+          chmod a+x runcpatch.sh
+          if [ -f "kernel/cgroup.c" ]; then
+            ./runcpatch.sh "kernel/cgroup.c"
+          else
+            echo "[WARN] kernel/cgroup.c not found; skip runc patch"
+          fi
+
       - name: Prepare .config from defconfig (lmi_defconfig)
         shell: bash
         working-directory: kernel_src
         run: |
           set -e
           mkdir -p "${OUT}"
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CC=clang
-          export LD=ld.lld
+          export ARCH=arm64 SUBARCH=arm64
+          export CC=clang LD=ld.lld
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CLANG_TRIPLE=aarch64-linux-gnu-
-          make LLVM="${LLVM}" O="${OUT}" ARCH="${ARCH}" lmi_defconfig
+          make LLVM="${LLVM}" O="${OUT}" ARCH="${ARCH}" "${DEFCONFIG}"
           make LLVM="${LLVM}" O="${OUT}" ARCH="${ARCH}" scripts
 
       - name: Apply xt_qtaguid patch (auto-detect path; non-fatal)
@@ -122,7 +148,7 @@ jobs:
             kernel/net/netfilter/xt_qtaguid.c \
             net/netfilter/xt_qtaguid/xt_qtaguid.c \
             kernel/net/netfilter/xt_qtaguid/xt_qtaguid.c ; do
-            if [ -f "${cand}" ]; then TARGET_FILE="${cand}"; break; fi
+            [ -f "${cand}" ] && TARGET_FILE="${cand}" && break || true
           done
           if [ -z "${TARGET_FILE}" ]; then
             echo "[WARN] xt_qtaguid source not found; skip patch."
@@ -135,8 +161,9 @@ jobs:
             patch -p1 < /tmp/xt_qtaguid.patch || true
             echo "[WARN] xt_qtaguid patch may have failed; continue"
           fi
-          
-      - name: Force-enable Docker-required CONFIGs (extended)
+
+      - name: Force-enable Docker/LXC-required CONFIGs (extended)
+        if: ${{ inputs.enable_docker_configs == 'true' }}
         shell: bash
         working-directory: kernel_src
         run: |
@@ -144,20 +171,19 @@ jobs:
           export ARCH=arm64 SUBARCH=arm64
           export CC=clang LD=ld.lld
           export CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-
-
           CFG="${OUT}/.config"
           SC="./scripts/config"
 
           enable_y() { "${SC}" --file "${CFG}" --enable "$1" || true; }
           enable_m() { "${SC}" --file "${CFG}" --module "$1" || true; }
-          set_str() { "${SC}" --file "${CFG}" --set-str "$1" "$2" || true; }
+          set_str()  { "${SC}" --file "${CFG}" --set-str "$1" "$2" || true; }
 
-          # 基础：可读出内核配置/本地版本标识
+          # 基础标识
           enable_y CONFIG_IKCONFIG
           enable_y CONFIG_IKCONFIG_PROC
-          set_str CONFIG_LOCALVERSION "-docker-ready"
+          set_str  CONFIG_LOCALVERSION "-docker-ready"
 
-          # Namespaces / Cgroups 基础（Docker必需）
+          # Namespaces / Cgroups（Docker 必需）
           enable_y CONFIG_NAMESPACES
           enable_y CONFIG_CGROUPS
           enable_y CONFIG_CGROUP_SCHED
@@ -166,20 +192,20 @@ jobs:
           enable_y CONFIG_CPUSETS
           enable_y CONFIG_MEMCG
 
-          # 你设备当前缺失的项（强制开启）
+          # 你的设备当前缺失的关键项（必须 y）：修复 runc 任务创建失败
           enable_y CONFIG_CGROUP_PIDS
           enable_y CONFIG_CGROUP_DEVICE
 
-          # OverlayFS 作为存储驱动
+          # OverlayFS 存储驱动
           enable_y CONFIG_OVERLAY_FS
 
-          # 虚拟网卡 + 桥接
+          # 虚拟网卡与桥
           enable_y CONFIG_VETH
           enable_y CONFIG_BRIDGE
-          # 关键：桥接进入 Netfilter（Docker bridge/NAT）
+          # 关键：桥接流量进入 iptables，确保 NAT/端口发布工作
           enable_y CONFIG_BRIDGE_NETFILTER
 
-          # Netfilter 基础/xtables
+          # Netfilter/xtables/conntrack/NAT
           enable_y CONFIG_NETFILTER
           enable_y CONFIG_NETFILTER_ADVANCED
           enable_y CONFIG_NETFILTER_XTABLES
@@ -189,52 +215,83 @@ jobs:
           enable_y CONFIG_IP_NF_FILTER
           enable_y CONFIG_IP_NF_MANGLE
 
-          # NAT/MASQUERADE（Docker 默认依赖）
+          # DOCKER 链常用：MASQUERADE + addrtype/conntrack/state/statistic
           enable_y CONFIG_NETFILTER_XT_NAT
           enable_y CONFIG_IP_NF_TARGET_MASQUERADE
           enable_y CONFIG_NF_NAT_MASQUERADE_IPV4
-          enable_y CONFIG_NF_NAT_MASQUERADE_IPV6
-
-          # 常用匹配（addrtype / conntrack / state / statistic）
           enable_y CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
           enable_y CONFIG_NETFILTER_XT_MATCH_CONNTRACK
           enable_y CONFIG_NETFILTER_XT_MATCH_STATE
           enable_y CONFIG_NETFILTER_XT_MATCH_STATISTIC
 
-          # 其它常见匹配/目标可按需开启（已有则忽略）
-          enable_y CONFIG_NETFILTER_XT_TARGET_REDIRECT
-          enable_y CONFIG_NETFILTER_XT_TARGET_TCPMSS
-          enable_y CONFIG_NETFILTER_XT_TARGET_TPROXY
-
-          # 固化为最终配置
           make LLVM="${LLVM}" O="${OUT}" ARCH="${ARCH}" olddefconfig
 
-          echo "[INFO] Summary of Docker-critical flags:"
-          zgrep -E 'CONFIG_(NAMESPACES|CGROUP|OVERLAY|VETH|BRIDGE|BRIDGE_NETFILTER|NETFILTER|XTABLES|NF_CONNTRACK|NF_NAT|IP_NF|MASQUERADE|ADDRTYPE|CONNTRACK|STATE|STATISTIC)=' "${CFG}" | sort || true
+          echo "[INFO] Docker-critical CONFIG summary:"
+          zgrep -E 'CONFIG_(CGROUP_PIDS|CGROUP_DEVICE|BRIDGE_NETFILTER|NETFILTER_XT_MATCH_ADDRTYPE|NAMESPACES|CGROUP|OVERLAY|VETH|BRIDGE|NETFILTER|XTABLES|NF_CONNTRACK|NF_NAT|IP_NF|MASQUERADE)=' "${OUT}/.config" | sort || true
 
-      - name: Validate container compatibility (Moby check-config.sh)
+      # ======== 编译后自动校验（轻量 + 官方二次校验）========
+      - name: Write local Docker kernel validator
         shell: bash
         working-directory: kernel_src
         run: |
           set -e
-          wget -O /tmp/check-config.sh https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh
+          mkdir -p .ci
+          cat > .ci/check_docker_kernel.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+CFG="${1:-out/.config}"
+req=( CGROUP_PIDS CGROUP_DEVICE BRIDGE_NETFILTER NETFILTER_XT_MATCH_ADDRTYPE
+      NAMESPACES CGROUPS OVERLAY_FS VETH BRIDGE NETFILTER NETFILTER_XTABLES
+      NF_CONNTRACK NF_NAT IP_NF_IPTABLES IP_NF_FILTER IP_NF_MANGLE IP_NF_TARGET_MASQUERADE )
+missing=0
+for f in "${req[@]}"; do
+  if zgrep -q "CONFIG_${f}=[ym]" "$CFG"; then
+    echo "OK: CONFIG_${f}"
+  else
+    echo "MISSING: CONFIG_${f}"
+    missing=$((missing+1))
+  fi
+done
+[ "$missing" -eq 0 ] || { echo "ERROR: missing $missing required flags"; exit 2; }
+SH
+          chmod +x .ci/check_docker_kernel.sh
+
+      - name: Validate Docker kernel flags (local)
+        shell: bash
+        working-directory: kernel_src
+        run: |
+          set -e
+          .ci/check_docker_kernel.sh "${OUT}/.config"
+
+      - name: Run moby check-config.sh (reference)
+        shell: bash
+        working-directory: kernel_src
+        run: |
+          set -e
+          curl -L -o /tmp/check-config.sh https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh
           chmod +x /tmp/check-config.sh
-          /tmp/check-config.sh "${OUT}/.config" || true
+          /tmp/check-config.sh "${OUT}/.config" | tee docker-check-config-full.txt
 
-      - name: Build kernel (Image.gz / Image.gz-dtb)
+      - name: Upload kernel validation reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-kernel-check
+          path: |
+            kernel_src/docker-check-config-full.txt
+
+      - name: Build kernel (Image.gz / Image.gz-dtb / Image)
         shell: bash
         working-directory: kernel_src
         run: |
           set -e
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CC=clang
-          export LD=ld.lld
+          export ARCH=arm64 SUBARCH=arm64
+          export CC=clang LD=ld.lld
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CLANG_TRIPLE=aarch64-linux-gnu-
           make LLVM="${LLVM}" O="${OUT}" -j"$(nproc)"
           ls -la "${OUT}/arch/arm64/boot" || true
 
+      # -------- 打包：镜像置于 ZIP 根目录（不再压缩 Image）--------
       - name: Pack AnyKernel3 zip
         shell: bash
         run: |
@@ -242,34 +299,48 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
           cd ak3
 
-          # 基本兼容：关闭设备检查/自动分区/自动 slot
+          # 兼容：关闭设备检查/自动分区/自动 slot
           sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
           sed -i 's!BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!BLOCK=auto;!g' anykernel.sh
           sed -i 's/is_slot_device=0;/is_slot_device=auto;/g' anykernel.sh
 
           SRC="../kernel_src/${OUT}/arch/${ARCH}/boot"
-          # 把镜像放到 zip 根目录（不是 kernel/），符合你的刷写要求
-          # 优先级：Image.gz-dtb > Image.gz > Image；不做任何压缩转换
+
+          # 内核镜像直接放 ZIP 根目录：优先 Image.gz-dtb > Image.gz > Image
           if [ -f "${SRC}/Image.gz-dtb" ]; then
             cp "${SRC}/Image.gz-dtb" .
-            echo "[INFO] Placed Image.gz-dtb at zip root"
+            echo "[INFO] Placed Image.gz-dtb at ZIP root"
           elif [ -f "${SRC}/Image.gz" ]; then
             cp "${SRC}/Image.gz" .
-            echo "[INFO] Placed Image.gz at zip root"
+            echo "[INFO] Placed Image.gz at ZIP root"
           elif [ -f "${SRC}/Image" ]; then
             cp "${SRC}/Image" .
-            echo "[INFO] Placed Image at zip root"
+            echo "[INFO] Placed Image at ZIP root"
           else
             echo "[ERROR] No kernel image found!" && ls -la "${SRC}" && exit 1
           fi
 
-          # 可选附带：把 dtbo.img / dtb 放入 kernel/ 目录，避免根目录太“杂”
+          # 可选：dtbo.img / dtb 放到 kernel/ 子目录
           mkdir -p kernel
           [ -f "${SRC}/dtbo.img" ] && cp "${SRC}/dtbo.img" kernel/ || true
-          [ -d "${SRC}/dtb" ] && cp -r "${SRC}/dtb" kernel/ || true
+          [ -d "${SRC}/dtb" ]      && cp -r "${SRC}/dtb" kernel/ || true
+
+          # 注入友好显示信息（可选）
+          AK3_STR=${{ toJSON(inputs.ak3_kernel_string) }}
+          DEV_STR=${{ toJSON(inputs.device) }}
+          SUP_STR=${{ toJSON(inputs.ak3_supported_versions) }}
+          AK3_STR=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]))' "${AK3_STR}")
+          DEV_STR=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]))' "${DEV_STR}")
+          SUP_STR=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]))' "${SUP_STR}")
+          awk -v kstr="$AK3_STR" -v dev="$DEV_STR" -v sup="$SUP_STR" '
+            BEGIN{FS=OFS="="}
+            /^kernel.string=/      { $0="kernel.string="kstr; print; next }
+            /^device.name1=/       { $0="device.name1="dev; print; next }
+            /^supported.versions=/ { $0="supported.versions="sup; print; next }
+            { print }
+          ' anykernel.sh > anykernel.sh.tmp && mv anykernel.sh.tmp anykernel.sh
 
           ZIP="../Docker-ready-kernel-${{ inputs.device }}-${{ inputs.branch }}.zip"
-          # 打包：根目录包含镜像文件，kernel/ 目录包含 dtb/dtbo（如有）
           zip -r9 "$ZIP" .
           echo "AK3 zip: $ZIP"
 
@@ -282,17 +353,40 @@ jobs:
             kernel_src/out/arch/arm64/boot/*
             kernel_src/out/.config
 
+      - name: Prepare Release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -e
+          DATE=$(date +'%Y%m%d')
+          if [ -z "${{ inputs.release_tag }}" ]; then
+            TAG="lmi-docker-${{ inputs.branch }}-${DATE}-v3.7.3"
+          else
+            TAG="${{ inputs.release_tag }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "name=Docker-ready kernel for lmi (${TAG})" >> "$GITHUB_OUTPUT"
+          {
+            echo "body= ## Docker-ready kernel for lmi — v3.7.3"
+            echo " - Repo: ${{ inputs.repo_url }}"
+            echo " - Branch: ${{ inputs.branch }}"
+            echo " - Defconfig: ${DEFCONFIG}"
+            echo " - Includes LXC/Docker defconfig injection + runc patch (Flyme66 release scripts)"
+            echo " - Docker-critical CONFIGs force-enabled (pids/device/bridge-netfilter/addrtype)"
+            echo " - xt_qtaguid patch applied (best-effort, non-fatal)"
+            echo " - AnyKernel3 zip: kernel image placed at ZIP root"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: v${{ github.run_number }}
-          name: "Kernel Build - ${{ inputs.device }} (${{ inputs.branch }})"
-          body: |
-            ## Docker-ready kernel for ${{ inputs.device }}
-            - Branch: ${{ inputs.branch }}
-            - AnyKernel3 zip: kernel image placed at ZIP root (per flash requirement)
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          body: ${{ steps.meta.outputs.body }}
+          draft: false
+          prerelease: false
           files: |
             Docker-ready-kernel-${{ inputs.device }}-${{ inputs.branch }}.zip
             kernel_src/out/arch/arm64/boot/Image*
