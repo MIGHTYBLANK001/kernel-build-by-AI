@@ -4,11 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: "要构建的内核源码分支（留空则使用远端默认分支）"
+        description: "要构建的内核源码分支（留空则用远端默认分支）"
         required: false
   push:
-    branches:
-      - "*"
+    branches: [ "*" ]
 
 permissions:
   contents: write
@@ -28,12 +27,11 @@ env:
 jobs:
   build-package-release:
     runs-on: ubuntu-latest
-
     steps:
       - name: Prepare workspace
-        run: |
-          mkdir -p workspace
+        run: mkdir -p workspace
 
+      # 依赖：增加交叉 GCC，满足脚本探测需求（gcc-version.sh）
       - name: Install build deps
         run: |
           sudo apt-get update
@@ -63,11 +61,11 @@ jobs:
             echo "branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Fetch Proton-Clang & setup PATH
+      # 下载工具链但不修改 Runner 的全局 PATH（避免 host 阶段误用）
+      - name: Fetch Proton-Clang (toolchain)
         run: |
           mkdir -p "${CLANG_DIR}"
           curl -L "${CLANG_URL}" | tar -xz --strip-components=1 -C "${CLANG_DIR}"
-          echo "${PWD}/${CLANG_DIR}/bin" >> "$GITHUB_PATH"
 
       - name: Fetch patches (cgroup + xt_qtaguid)
         run: |
@@ -92,133 +90,72 @@ jobs:
             echo "xt_qtaguid not found; skip."
           fi
 
-      - name: Kernel clean & defconfig (lmi)
+      # --- Host 阶段：清理/defconfig/scripts（只用系统 gcc/ld；不设 LLVM=1/LD） ---
+      - name: Kernel clean (host tools only)
         run: |
           set -eux
           cd workspace/kernel_src
+          make O=out ARCH=${ARCH} HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld clean || true
+          make O=out ARCH=${ARCH} HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld mrproper || true
 
-          make O=out ARCH=${ARCH} \
-            HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld \
-            LLVM=1 CC=clang LD=ld.lld \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            clean || true
-
-          make O=out ARCH=${ARCH} \
-            HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld \
-            LLVM=1 CC=clang LD=ld.lld \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            mrproper || true
-
+      - name: Defconfig (host tools only)
+        run: |
+          set -eux
+          cd workspace/kernel_src
           [ -f "${DEFCONFIG_PATH}" ] || { echo "::error::DEFCONFIG missing"; exit 1; }
-
-          make O=out ARCH=${ARCH} \
-            HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld \
-            LLVM=1 CC=clang LD=ld.lld \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            "${DEFCONFIG_PATH}"
+          make O=out ARCH=${ARCH} HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld "${DEFCONFIG_PATH}"
 
       - name: Build kernel scripts (to get scripts/config)
         run: |
           set -eux
           cd workspace/kernel_src
-          make O=out ARCH=${ARCH} \
-            HOSTCC=gcc HOSTLD=/usr/bin/ld \
-            scripts
+          make O=out ARCH=${ARCH} HOSTCC=gcc HOSTLD=/usr/bin/ld scripts
 
-      # === 开启“全部”Docker 支持项（来自 moby check-config 的必要+常见可选）===
+      # --- 开启全部 Docker 支持项（参考 moby check-config） ---
       - name: Enable ALL Docker-related kernel configs
         run: |
           set -eux
           cd workspace/kernel_src
-
-          # Helper
           enable() { scripts/config --enable "$1" || true; }
           module() { scripts/config --module "$1" || true; }
 
-          # --- Generally Necessary ---
-          enable CONFIG_NAMESPACES
-          enable CONFIG_NET_NS
-          enable CONFIG_PID_NS
-          enable CONFIG_IPC_NS
-          enable CONFIG_UTS_NS
-          enable CONFIG_USER_NS          # rootless/docker 推荐
-          enable CONFIG_KEYS
-          enable CONFIG_SECCOMP
-          enable CONFIG_DEVPTS_MULTIPLE_INSTANCES
-          enable CONFIG_POSIX_MQUEUE
-
-          enable CONFIG_CGROUPS
-          enable CONFIG_CGROUP_CPUACCT
-          enable CONFIG_CGROUP_DEVICE
-          enable CONFIG_CGROUP_FREEZER
-          enable CONFIG_CGROUP_SCHED
-          enable CONFIG_CPUSETS
-          enable CONFIG_MEMCG
-
-          enable CONFIG_VETH
-          enable CONFIG_BRIDGE
-          enable CONFIG_BRIDGE_NETFILTER
-
-          # IPv4/iptables/NAT/MASQUERADE/conntrack/ipvs
-          enable CONFIG_IP_NF_FILTER
-          enable CONFIG_IP_NF_MANGLE
-          enable CONFIG_IP_NF_NAT
-          enable CONFIG_NF_NAT
-          enable CONFIG_NF_NAT_NEEDED
-          enable CONFIG_IP_NF_TARGET_MASQUERADE
-          enable CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
-          enable CONFIG_NETFILTER_XT_MATCH_CONNTRACK
+          # Generally Necessary
+          for K in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_IPC_NS CONFIG_UTS_NS CONFIG_USER_NS \
+                   CONFIG_KEYS CONFIG_SECCOMP CONFIG_DEVPTS_MULTIPLE_INSTANCES CONFIG_POSIX_MQUEUE \
+                   CONFIG_CGROUPS CONFIG_CGROUP_CPUACCT CONFIG_CGROUP_DEVICE CONFIG_CGROUP_FREEZER \
+                   CONFIG_CGROUP_SCHED CONFIG_CPUSETS CONFIG_MEMCG \
+                   CONFIG_VETH CONFIG_BRIDGE CONFIG_BRIDGE_NETFILTER \
+                   CONFIG_IP_NF_FILTER CONFIG_IP_NF_MANGLE CONFIG_IP_NF_NAT CONFIG_NF_NAT CONFIG_NF_NAT_NEEDED \
+                   CONFIG_IP_NF_TARGET_MASQUERADE CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_NETFILTER_XT_MATCH_CONNTRACK
+          do enable "$K"; done
           module CONFIG_NETFILTER_XT_MATCH_IPVS
 
-          # --- Optional Features (常见场景启用以减少报错) ---
-          enable CONFIG_CGROUP_PIDS
-          enable CONFIG_BLK_CGROUP
-          enable CONFIG_CGROUP_PERF
-          enable CONFIG_CGROUP_HUGETLB
-          enable CONFIG_NET_CLS_CGROUP
-          enable CONFIG_CGROUP_NET_PRIO
-          enable CONFIG_CFS_BANDWIDTH
-          enable CONFIG_FAIR_GROUP_SCHED
-          enable CONFIG_RT_GROUP_SCHED     # 如不需要实时组，可改为禁用
-          enable CONFIG_MEMCG_SWAP         || true
-          enable CONFIG_MEMCG_SWAP_ENABLED || true
-          enable CONFIG_MEMCG_KMEM         || true
+          # Optional Features
+          for K in CONFIG_CGROUP_PIDS CONFIG_BLK_CGROUP CONFIG_CGROUP_PERF CONFIG_CGROUP_HUGETLB \
+                   CONFIG_NET_CLS_CGROUP CONFIG_CGROUP_NET_PRIO CONFIG_CFS_BANDWIDTH CONFIG_FAIR_GROUP_SCHED CONFIG_RT_GROUP_SCHED \
+                   CONFIG_MEMCG_SWAP CONFIG_MEMCG_SWAP_ENABLED CONFIG_MEMCG_KMEM
+          do enable "$K"; done
 
-          # --- Network drivers for Docker networks (overlay/macvlan/ipvlan 等) ---
-          module CONFIG_VXLAN
-          module CONFIG_MACVLAN
-          module CONFIG_IPVLAN
-          module CONFIG_DUMMY
+          # Network drivers
+          for K in CONFIG_VXLAN CONFIG_MACVLAN CONFIG_IPVLAN CONFIG_DUMMY; do module "$K"; done
 
-          # --- Optional for encrypted networks/IPsec/XFRM ---
-          enable CONFIG_CRYPTO
-          enable CONFIG_CRYPTO_AEAD
-          enable CONFIG_CRYPTO_GCM
-          enable CONFIG_CRYPTO_SEQIV
-          enable CONFIG_CRYPTO_GHASH
-          enable CONFIG_XFRM
-          enable CONFIG_XFRM_USER
-          module CONFIG_XFRM_ALGO
-          module CONFIG_INET_ESP
-          module CONFIG_INET_XFRM_MODE_TRANSPORT
+          # Encrypted networks / IPsec
+          for K in CONFIG_CRYPTO CONFIG_CRYPTO_AEAD CONFIG_CRYPTO_GCM CONFIG_CRYPTO_SEQIV CONFIG_CRYPTO_GHASH CONFIG_XFRM CONFIG_XFRM_USER
+          do enable "$K"; done
+          for K in CONFIG_XFRM_ALGO CONFIG_INET_ESP CONFIG_INET_XFRM_MODE_TRANSPORT; do module "$K"; done
 
-          # --- Storage drivers（保持 overlay 必开，其它驱动尽量模块化）---
+          # Storage drivers
           enable CONFIG_OVERLAY_FS
           module CONFIG_BLK_DEV_DM
           module CONFIG_DM_THIN_PROVISIONING
           module CONFIG_BTRFS_FS
           module CONFIG_BTRFS_FS_POSIX_ACL
-          # AUFS/ZFS 通常为外部树，不强制
 
-          # --- Docker 28.0.0+ ipset 新增检查 ---
+          # Docker 28+ ipset
           module CONFIG_IP_SET
           module CONFIG_IP_SET_HASH_NET
           module CONFIG_NETFILTER_XT_SET
 
-          # 固化依赖
           make O=out olddefconfig
 
       - name: Run moby check-config.sh against out/.config
@@ -229,14 +166,15 @@ jobs:
           chmod +x check-config.sh
           ./check-config.sh out/.config | tee ../docker-kernel-check.txt
 
-      - name: Build kernel
+      # --- 目标内核编译：仅在此步启用 LLVM=1 + CC=clang（局部传工具链根） ---
+      - name: Build kernel (target; LLVM/Clang)
         run: |
           set -eux
           cd workspace/kernel_src
           JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo ${THREADS_DEFAULT})"
           make -j"${JOBS}" O=out ARCH=${ARCH} \
-            HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld \
-            LLVM=1 CC=clang LD=ld.lld \
+            LLVM="${PWD}/../../${CLANG_DIR}/bin/" \
+            CC=clang LD=ld.lld \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
@@ -245,12 +183,8 @@ jobs:
         run: |
           set -e
           cd workspace/kernel_src
-          for f in \
-            out/arch/arm64/boot/Image.gz-dtb \
-            out/arch/arm64/boot/Image.gz \
-            out/arch/arm64/boot/Image-dtb \
-            out/arch/arm64/boot/Image \
-          ; do [ -f "$f" ] && { echo "image=$f" >> "$GITHUB_OUTPUT"; echo "Found: $f"; exit 0; }; done
+          for f in out/arch/arm64/boot/Image.gz-dtb out/arch/arm64/boot/Image.gz out/arch/arm64/boot/Image-dtb out/arch/arm64/boot/Image
+          do [ -f "$f" ] && { echo "image=$f" >> "$GITHUB_OUTPUT"; echo "Found: $f"; exit 0; }; done
           echo "::error::未找到内核镜像"; exit 1
 
       - name: Clone AnyKernel3 & disable device check
