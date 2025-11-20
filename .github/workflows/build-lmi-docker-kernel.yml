@@ -1,303 +1,285 @@
-name: Build lmi Kernel → Docker-ready configs → AnyKernel3 → Release
+name: Build Docker-ready kernel (SM8250/lmi) - v3.8
 
 on:
   workflow_dispatch:
     inputs:
+      repo_url:
+        description: "Kernel repo URL"
+        required: true
+        default: "https://github.com/liyafe1997/kernel_xiaomi_sm8250_mod"
       branch:
-        description: "要构建的内核源码分支（留空则使用远端默认分支）"
+        description: "Kernel branch"
+        required: true
+        default: "android15-lineage22-mod"
+      device:
+        description: "Device codename"
+        required: true
+        default: "lmi"
+      release_tag:
+        description: "Release tag (auto if empty)"
         required: false
-      strict_werror:
-        description: "是否保持 CONFIG_WERROR 严格模式（true=警告当错误；false=在CI中放宽）"
-        required: false
-        default: "false"
-  push:
-    branches: [ "*" ]
+        default: ""
 
 permissions:
   contents: write
 
-env:
-  ARCH: arm64
-  SUBARCH: arm64
-  THREADS_DEFAULT: 8
-  KERNEL_REPO: https://github.com/ApartTUSITU/kernel_xiaomi_sm8250_mod
-  DEFCONFIG_PATH: arch/arm64/configs/lmi_defconfig
-  CLANG_URL: https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.tar.gz
-  CLANG_DIR: toolchains/proton-clang
-  ANYKERNEL3_REPO: https://github.com/osm0sis/AnyKernel3.git
-  PATCH_CGROUP_URL: https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/patch/cgroup.patch
-  PATCH_QTAGUID_URL: https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/patch/xt_qtaguid.patch
+concurrency:
+  group: docker-kernel-lmi-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build-package-release:
+  build:
     runs-on: ubuntu-latest
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      OUT: out
+      CC: clang
+      LD: ld.lld
+      LLVM: -15
+      KBUILD_BUILD_USER: "gh-actions"
+      KBUILD_BUILD_HOST: "ubuntu"
+      TZ: "Asia/Shanghai"
 
     steps:
-      - name: Prepare workspace
-        run: mkdir -p workspace
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            coreutils util-linux \
-            bc bison flex libssl-dev \
-            libelf-dev dwarves pkg-config zstd \
-            zip unzip python3 rsync ccache git curl tar \
-            patch xz-utils gzip \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
 
       - name: Clone kernel source
-        id: kernel_clone
         run: |
           set -e
-          cd workspace
-          REPO="${KERNEL_REPO}"
-          USER_BRANCH="${{ github.event.inputs.branch }}"
-          if [ -n "${USER_BRANCH}" ]; then
-            git clone --depth=1 --branch "${USER_BRANCH}" "${REPO}" kernel_src
-            echo "branch=${USER_BRANCH}" >> "$GITHUB_OUTPUT"
-          else
-            DEFAULT_BRANCH="$(git ls-remote --symref "${REPO}" HEAD | awk '/^ref:/ {print $2}' | awk -F'/' '{print $NF}')"
-            [ -z "${DEFAULT_BRANCH}" ] && { echo "::error::Detect default branch failed"; exit 1; }
-            git clone --depth=1 --branch "${DEFAULT_BRANCH}" "${REPO}" kernel_src
-            echo "branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
-          fi
+          git clone --depth=1 -b "${{ inputs.branch }}" "${{ inputs.repo_url }}" kernel_src
+          cd kernel_src
+          git rev-parse --short HEAD
 
-      - name: Fetch Proton-Clang (toolchain)
-        run: |
-          mkdir -p "${CLANG_DIR}"
-          curl -L "${CLANG_URL}" | tar -xz --strip-components=1 -C "${CLANG_DIR}"
-
-      - name: Fetch patches (cgroup + xt_qtaguid)
-        run: |
-          set -eux
-          cd workspace
-          curl -L "${PATCH_CGROUP_URL}"  -o cgroup.patch
-          curl -L "${PATCH_QTAGUID_URL}" -o xt_qtaguid.patch
-
-      - name: Apply cgroup.patch (mandatory)
-        run: |
-          set -eux
-          cd workspace/kernel_src
-          (git apply --index ../cgroup.patch) || (patch -p1 < ../cgroup.patch)
-
-      - name: Conditionally apply xt_qtaguid.patch
-        run: |
-          set -eux
-          cd workspace/kernel_src
-          if grep -R -I -nE "qtaguid|XT_QTAGUID|NETFILTER_XT_(MATCH|TARGET)_QTAGUID" . ; then
-            (git apply --index ../xt_qtaguid.patch) || (patch -p1 < ../xt_qtaguid.patch)
-          else
-            echo "xt_qtaguid not found; skip."
-          fi
-
-      # 彻底清洁源码树（防 srctree 污染）
-      - name: Source tree mrproper (clean srctree)
-        run: |
-          set -eux
-          cd workspace/kernel_src
-          make ARCH=${ARCH} mrproper
-          # 防御式清理（若因意外创建过 .config / include/config）
-          rm -f .config || true
-          rm -rf include/config || true
-
-      # Defconfig：生成 out/.config，并显式指向它
-      - name: Defconfig (host tools only → out/.config)
-        run: |
-          set -eux
-          cd workspace/kernel_src
-          [ -f "${DEFCONFIG_PATH}" ] || { echo "::error::DEFCONFIG missing"; exit 1; }
-          KCONFIG_CONFIG=out/.config \
-          make O=out ARCH=${ARCH} HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld lmi_defconfig
-
-      # 构建 scripts，随后先做一次 olddefconfig（确保当前树下新符号默认化）
-      - name: Build kernel scripts & initial olddefconfig
-        run: |
-          set -eux
-          cd workspace/kernel_src
-          make O=out ARCH=${ARCH} \
-            HOSTCC=gcc HOSTLD=/usr/bin/ld \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LD=aarch64-linux-gnu-ld \
-            scripts
-          KCONFIG_CONFIG=out/.config \
-          make O=out olddefconfig
-
-      # 代码贴片：WALT 格式/未用变量（仅修改源码，不写 .config）
-      - name: Patch WALT warnings (unused + format safety)
-        run: |
-          set -eux
-          cd workspace/kernel_src
-          sed -i 's/^\s*static\s\+int\s\+in_sched_bug\s*;/static int __maybe_unused in_sched_bug;/' kernel/sched/walt.h || true
-          sed -i 's/\(\<irqtime\>\s*%\)u/\1llu/g' include/trace/events/walt.h || true
-          sed -i 's/\(\<rq_cs\>\s*%\)u/\1llu/g'    include/trace/events/walt.h || true
-          sed -i 's/\(\<rq_ps\>\s*%\)u/\1llu/g'    include/trace/events/walt.h || true
-          sed -i 's/\(\<nt_cs\>\s*%\)u/\1llu/g'    include/trace/events/walt.h || true
-          sed -i 's/\(\<nt_ps\>\s*%\)u/\1llu/g'    include/trace/events/walt.h || true
-
-      # （可选）关闭 WERROR 并放宽两类常见告警；strict_werror=true 时跳过
-      - name: Disable WERROR and relax warnings for CI
-        if: ${{ github.event.inputs.strict_werror != 'true' }}
-        run: |
-          set -eux
-          cd workspace/kernel_src
-          KCONFIG_CONFIG=out/.config \
-          scripts/config --disable CONFIG_WERROR
-          KCONFIG_CONFIG=out/.config \
-          make O=out olddefconfig
-
-      # 启用全部 Docker 支持项（显式指向 out/.config）
-      - name: Enable ALL Docker-related kernel configs
-        run: |
-          set -eux
-          cd workspace/kernel_src
-          export KCONFIG_CONFIG=out/.config
-          enable() { scripts/config --enable "$1" || true; }
-          module() { scripts/config --module "$1" || true; }
-
-          # Generally Necessary
-          for K in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_IPC_NS CONFIG_UTS_NS CONFIG_USER_NS \
-                   CONFIG_KEYS CONFIG_SECCOMP CONFIG_DEVPTS_MULTIPLE_INSTANCES CONFIG_POSIX_MQUEUE \
-                   CONFIG_CGROUPS CONFIG_CGROUP_CPUACCT CONFIG_CGROUP_DEVICE CONFIG_CGROUP_FREEZER \
-                   CONFIG_CGROUP_SCHED CONFIG_CPUSETS CONFIG_MEMCG \
-                   CONFIG_VETH CONFIG_BRIDGE CONFIG_BRIDGE_NETFILTER \
-                   CONFIG_IP_NF_FILTER CONFIG_IP_NF_MANGLE CONFIG_IP_NF_NAT CONFIG_NF_NAT CONFIG_NF_NAT_NEEDED \
-                   CONFIG_IP_NF_TARGET_MASQUERADE CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_NETFILTER_XT_MATCH_CONNTRACK
-          do enable "$K"; done
-          module CONFIG_NETFILTER_XT_MATCH_IPVS
-
-          # Optional Features
-          for K in CONFIG_CGROUP_PIDS CONFIG_BLK_CGROUP CONFIG_CGROUP_PERF CONFIG_CGROUP_HUGETLB \
-                   CONFIG_NET_CLS_CGROUP CONFIG_CGROUP_NET_PRIO CONFIG_CFS_BANDWIDTH CONFIG_FAIR_GROUP_SCHED CONFIG_RT_GROUP_SCHED \
-                   CONFIG_MEMCG_SWAP CONFIG_MEMCG_SWAP_ENABLED CONFIG_MEMCG_KMEM
-          do enable "$K"; done
-
-          # Network drivers
-          for K in CONFIG_VXLAN CONFIG_MACVLAN CONFIG_IPVLAN CONFIG_DUMMY; do module "$K"; done
-
-          # Encrypted networks / IPsec
-          for K in CONFIG_CRYPTO CONFIG_CRYPTO_AEAD CONFIG_CRYPTO_GCM CONFIG_CRYPTO_SEQIV CONFIG_CRYPTO_GHASH CONFIG_XFRM CONFIG_XFRM_USER
-          do enable "$K"; done
-          for K in CONFIG_XFRM_ALGO CONFIG_INET_ESP CONFIG_INET_XFRM_MODE_TRANSPORT; do module "$K"; done
-
-          # Storage
-          enable CONFIG_OVERLAY_FS
-          module CONFIG_BLK_DEV_DM
-          module CONFIG_DM_THIN_PROVISIONING
-          module CONFIG_BTRFS_FS
-          module CONFIG_BTRFS_FS_POSIX_ACL
-
-          # Docker 28+ ipset
-          module CONFIG_IP_SET
-          module CONFIG_IP_SET_HASH_NET
-          module CONFIG_NETFILTER_XT_SET
-
-          make O=out olddefconfig
-
-      # 自检：Moby 官方 check-config.sh
-      - name: Run moby check-config.sh against out/.config
-        run: |
-          set -eux
-          cd workspace/kernel_src
-          curl -L https://github.com/moby/moby/raw/master/contrib/check-config.sh -o check-config.sh
-          chmod +x check-config.sh
-          ./check-config.sh out/.config | tee ../docker-kernel-check.txt
-
-      # 目标内核编译前，再做一次 olddefconfig（启用 LLVM 后新符号默认化）
-      - name: Final olddefconfig after enabling LLVM path
-        run: |
-          set -eux
-          cd workspace/kernel_src
-          export PATH="${PWD}/../../${CLANG_DIR}/bin:${PATH}"
-          KCONFIG_CONFIG=out/.config \
-          make O=out olddefconfig
-
-      # 目标内核编译：目标侧 LLVM/Clang；主机侧钉回系统
-      - name: Build kernel (target; LLVM/Clang + host pinned)
-        run: |
-          set -eux
-          cd workspace/kernel_src
-          export PATH="${PWD}/../../${CLANG_DIR}/bin:${PATH}"
-          JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo ${THREADS_DEFAULT})"
-
-          if [ "${{ github.event.inputs.strict_werror }}" = "true" ]; then
-            KCFLAGS_EXTRA=""
-          else
-            KCFLAGS_EXTRA="-Wno-error=format -Wno-error=unused-variable"
-          fi
-
-          make -j"${JOBS}" O=out ARCH=${ARCH} \
-            LLVM=1 LLVM_IAS=1 \
-            CC=clang LD=ld.lld \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            HOSTCC=gcc HOSTCXX=g++ HOSTLD=/usr/bin/ld HOSTAR=ar \
-            KCONFIG_CONFIG=out/.config \
-            KCFLAGS="${KCFLAGS_EXTRA}"
-
-      - name: Locate built image
-        id: findimg
+      - name: Install build deps (clang/llvm/binutils)
         run: |
           set -e
-          cd workspace/kernel_src
-          for f in \
-            out/arch/arm64/boot/Image.gz-dtb \
-            out/arch/arm64/boot/Image.gz \
-            out/arch/arm64/boot/Image-dtb \
-            out/arch/arm64/boot/Image
-          do [ -f "$f" ] && { echo "image=$f" >> "$GITHUB_OUTPUT"; echo "Found: $f"; exit 0; }; done
-          echo "::error::未找到内核镜像"; exit 1
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex \
+            libssl-dev libelf-dev dwarves \
+            git curl wget zip unzip \
+            python3 python3-pip \
+            build-essential \
+            clang-15 llvm-15 lld-15 \
+            llvm-15-tools \
+            binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          # unsuffixed symlinks for CC/LD; other llvm-* use LLVM=-15
+          sudo ln -sf /usr/bin/clang-15 /usr/bin/clang
+          sudo ln -sf /usr/bin/ld.lld-15 /usr/bin/ld.lld
+          sudo ln -sf /usr/bin/llvm-objdump-15 /usr/bin/llvm-objdump
+          sudo ln -sf /usr/bin/llvm-objcopy-15 /usr/bin/llvm-objcopy
+          sudo ln -sf /usr/bin/llvm-ar-15 /usr/bin/llvm-ar
+          sudo ln -sf /usr/bin/llvm-nm-15 /usr/bin/llvm-nm
 
-      - name: Clone AnyKernel3 & disable device check
+      - name: Verify LLVM toolchain presence
         run: |
-          set -eux
-          cd workspace
-          git clone --depth=1 "${ANYKERNEL3_REPO}" ak3
-          sed -i "s/^do.devicecheck=.*/do.devicecheck=0/" ak3/anykernel.sh
-          sed -i '/^device.name[0-9]\+=/d' ak3/anykernel.sh
-          BRANCH="${{ steps.kernel_clone.outputs.branch }}"
-          sed -i "s/^kernel.string=.*/kernel.string=${BRANCH} $(date +%Y-%m-%d)/" ak3/anykernel.sh
+          set -e
+          for t in clang-15 ld.lld-15 llvm-objdump-15 llvm-objcopy-15 llvm-ar-15 llvm-nm-15; do
+            which $t && $t --version || true; done
+          for t in clang ld.lld llvm-objdump llvm-objcopy llvm-ar llvm-nm; do
+            which $t && $t --version || true; done
 
-      - name: Prepare AK3 payload (image at zip root)
+      #####################################################################
+      # PATCHES — apply BEFORE configuration & build
+      #####################################################################
+
+      - name: Apply REQUIRED cgroup.patch (must succeed)
+        working-directory: kernel_src
         run: |
-          set -eux
-          cd workspace
-          cp "kernel_src/${{ steps.findimg.outputs.image }}" ak3/
-          if [ -d "kernel_src/out/lib/modules" ]; then
-            rsync -a kernel_src/out/lib/modules/ ak3/modules/system/lib/modules/
+          set -e
+          URL="https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/patch/cgroup.patch"
+          echo "[INFO] Fetch: $URL"
+          curl -L -o /tmp/cgroup.patch "$URL"
+          # try git apply; fallback to patch; if all fail → exit 1
+          if ! git apply --reject --verbose /tmp/cgroup.patch; then
+            echo "[WARN] git apply failed; trying patch -p0/-p1"
+            patch -p0 < /tmp/cgroup.patch || patch -p1 < /tmp/cgroup.patch
+          fi
+          echo "[INFO] cgroup.patch applied successfully."
+
+      - name: Conditionally apply xt_qtaguid.patch (only if module/config present)
+        working-directory: kernel_src
+        run: |
+          set -e
+          URL="https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/patch/xt_qtaguid.patch"
+          echo "[INFO] Fetch: $URL"
+          curl -L -o /tmp/xt_qtaguid.patch "$URL"
+
+          TARGET_FILE=""
+          for cand in \
+            net/netfilter/xt_qtaguid.c \
+            kernel/net/netfilter/xt_qtaguid.c \
+            net/netfilter/xt_qtaguid/xt_qtaguid.c \
+            kernel/net/netfilter/xt_qtaguid/xt_qtaguid.c ; do
+            if [ -f "$cand" ]; then TARGET_FILE="$cand"; break; fi
+          done
+
+          HAS_CFG=$(grep -Rsn "CONFIG_NETFILTER_XT_MATCH_QTAGUID" . || true)
+          if [ -n "$TARGET_FILE" ] || [ -n "$HAS_CFG" ]; then
+            echo "[INFO] xt_qtaguid detected (file=$TARGET_FILE, cfg=$( [ -n "$HAS_CFG" ] && echo yes || echo no ) ); applying patch."
+            if ! git apply --reject --verbose /tmp/xt_qtaguid.patch; then
+              echo "[WARN] git apply failed; trying patch -p0/-p1 (non-fatal)"
+              patch -p0 < /tmp/xt_qtaguid.patch || patch -p1 < /tmp/xt_qtaguid.patch || echo "[WARN] xt_qtaguid patch failed; continue."
+            fi
+          else
+            echo "[INFO] xt_qtaguid not present in this kernel tree; skip patch."
           fi
 
-      - name: Make flashable zip (zip -9 deflate)
-        id: mkzip
-        run: |
-          set -eux
-          cd workspace
-          BRANCH="${{ steps.kernel_clone.outputs.branch }}"
-          TS="$(date +%Y%m%d-%H%M%S)"
-          PKG="${BRANCH}-${TS}"
-          (cd ak3 && zip -9 -r "../${PKG}.zip" .)
-          echo "pkg=${PKG}" >> "$GITHUB_OUTPUT"
-          ls -lh "${PKG}.zip"
+      #####################################################################
+      # CONFIGURATION — defconfig + force-enable Docker & eBPF configs
+      #####################################################################
 
-      - name: Upload check report artifact
+      - name: Prepare .config from defconfig (lmi_defconfig)
+        working-directory: kernel_src
+        run: |
+          set -e
+          mkdir -p ${OUT}
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CC=clang
+          export LD=ld.lld
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          make LLVM=${LLVM} O=${OUT} ARCH=${ARCH} lmi_defconfig
+          make LLVM=${LLVM} O=${OUT} ARCH=${ARCH} scripts
+
+      - name: Force-enable Docker & eBPF configs (maximal set)
+        working-directory: kernel_src
+        run: |
+          set -e
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CC=clang
+          export LD=ld.lld
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          CFG="${OUT}/.config"
+          SC="./scripts/config"
+
+          enable_y () { ${SC} --file "${CFG}" --enable "$1" || true; }
+          enable_m () { ${SC} --file "${CFG}" --module "$1" || true; }
+          set_str () { ${SC} --file "${CFG}" --set-str "$1" "$2" || true; }
+
+          # /proc/config.gz embedding + localversion
+          enable_y CONFIG_IKCONFIG
+          enable_y CONFIG_IKCONFIG_PROC
+          set_str CONFIG_LOCALVERSION "-docker-ready-ebpf"
+
+          # Namespaces
+          for K in NAMESPACES UTS_NS IPC_NS PID_NS NET_NS USER_NS; do enable_y CONFIG_${K}; done
+
+          # cgroups + v2 + perf/hugetlb/bpf
+          for K in CGROUPS CGROUP_DEVICE CPUSETS CGROUP_CPUACCT BLK_CGROUP MEMCG CGROUP_PIDS CGROUP_FREEZER CGROUP_SCHED CGROUP_WRITEBACK CGROUP_PERF CGROUP_HUGETLB CGROUP_BPF; do
+            enable_y CONFIG_${K}
+          done
+
+          # eBPF core (开启 eBPF/JIT/XDP/BPF in net)
+          for K in BPF BPF_SYSCALL BPF_JIT HAVE_EBPF_JIT; do enable_y CONFIG_${K}; done
+          for K in NET_CLS_BPF NET_ACT_BPF BPFILTER XDP_SOCKETS; do
+            # XDP_SOCKETS 在部分内核版本命名为 CONFIG_XDP_SOCKETS；不存在时不报错
+            enable_y CONFIG_${K}
+          done
+
+          # overlayfs
+          enable_y CONFIG_OVERLAY_FS
+
+          # 网络 & netfilter（IPv4/IPv6）
+          for K in VETH BRIDGE BRIDGE_NETFILTER NETFILTER NETFILTER_XTABLES \
+                   NF_CONNTRACK NF_NAT \
+                   IP_NF_IPTABLES IP_NF_FILTER IP_NF_MANGLE IP_NF_RAW IP_NF_SECURITY IP_NF_TARGET_MASQUERADE \
+                   IP6_NF_FILTER IP6_NF_MANGLE IP6_NF_RAW IP6_NF_NAT IP6_NF_TARGET_MASQUERADE; do
+            enable_y CONFIG_${K}
+          done
+
+          # ipset 家族（Docker 28+ 要求）
+          enable_m CONFIG_IP_SET
+          enable_m CONFIG_IP_SET_HASH_NET
+          enable_m CONFIG_NETFILTER_XT_SET
+
+          # nftables 家族（新栈）
+          for K in NF_TABLES NFT_CT NFT_MASQ NFT_NAT NFT_FIB_IPV4 NFT_FIB_IPV6; do
+            enable_y CONFIG_${K}
+          done
+
+          # 可选：IPVS（swarm/k8s IPVS 模式）
+          for K in IP_VS IP_VS_NFCT IP_VS_PROTO_TCP IP_VS_PROTO_UDP IP_VS_RR; do
+            enable_y CONFIG_${K}
+          done
+
+          # 生成最终 .config
+          make LLVM=${LLVM} O=${OUT} ARCH=${ARCH} olddefconfig
+
+          echo "[INFO] Effective Docker/eBPF configs in final .config:"
+          egrep -i 'CONFIG_(IKCONFIG|LOCALVERSION|NAMESPACES|CGROUP|BPF|XDP|OVERLAY|VETH|BRIDGE|NETFILTER|IP_SET|XT_SET|NF_TABLES|NFT_|IP_VS|IP_NF_)' ${OUT}/.config | sort || true
+
+      - name: Validate with Moby check-config.sh (informational)
+        working-directory: kernel_src
+        run: |
+          set -e
+          wget -O /tmp/check-config.sh https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh
+          chmod +x /tmp/check-config.sh
+          /tmp/check-config.sh ${OUT}/.config || true
+
+      #####################################################################
+      # BUILD — kernel (no AnyKernel3 packaging)
+      #####################################################################
+
+      - name: Build kernel (Image.gz / Image.gz-dtb)
+        working-directory: kernel_src
+        run: |
+          set -e
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CC=clang
+          export LD=ld.lld
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          # 如需进一步安静掉 LSE 警告，可启用：export KBUILD_CFLAGS="$KBUILD_CFLAGS -march=armv8-a+lse"
+          make LLVM=${LLVM} O=${OUT} -j$(nproc)
+          ls -la ${OUT}/arch/arm64/boot || true
+
+      - name: Upload artifacts (no AK3 zip)
         uses: actions/upload-artifact@v4
         with:
-          name: docker-kernel-check
-          path: workspace/docker-kernel-check.txt
+          name: lmi-docker-kernel-${{ inputs.branch }}-v3.8
+          path: |
+            kernel_src/out/arch/arm64/boot/Image*
+            kernel_src/out/.config
 
-      - name: Create Release & Upload asset
-        uses: ncipollo/release-action@v1
+      - name: Prepare Release metadata
+        id: meta
+        run: |
+          set -e
+          DATE=$(date +'%Y%m%d')
+          if [ -z "${{ inputs.release_tag }}" ]; then
+            TAG="lmi-docker-${{ inputs.branch }}-${DATE}-v3.8"
+          else
+            TAG="${{ inputs.release_tag }}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "name=Docker-ready kernel (no AK3) for lmi (${TAG})" >> $GITHUB_OUTPUT
+          echo "body=\
+          ## Docker-ready kernel for lmi — v3.8 (no AK3)\\n\
+          - Repo: ${{ inputs.repo_url }}\\n\
+          - Branch: ${{ inputs.branch }}\\n\
+          - Defconfig: lmi_defconfig\\n\
+          - Patches: cgroup.patch (required) + xt_qtaguid.patch (conditional)\\n\
+          - Docker & eBPF configs enabled (namespaces/cgroups/overlayfs/netfilter/ipset/nftables/ebpf/xdp)\\n\
+          " >> $GITHUB_OUTPUT
+
+      - name: Create Release and upload assets
+        uses: softprops/action-gh-release@v2
         with:
-          tag: ${{ steps.mkzip.outputs.pkg }}
-          name: ${{ steps.mkzip.outputs.pkg }}
-          body: |
-            Device: lmi
-            Branch: ${{ steps.kernel_clone.outputs.branch }}
-            Patches: cgroup (mandatory), xt_qtaguid (conditional)
-            Docker configs: enabled per moby check-config; see artifact.
-            Package: ${{ steps.mkzip.outputs.pkg }}.zip
-            AnyKernel3: devicecheck=0; image at zip root; deflate zip.
-          artifacts: workspace/${{ steps.mkzip.outputs.pkg }}.zip
-          allowUpdates: true
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          body: ${{ steps.meta.outputs.body }}
+          draft: false
+          prerelease: false
+          files: |
+            kernel_src/out/arch/arm64/boot/Image*
+            kernel_src/out/.config
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
