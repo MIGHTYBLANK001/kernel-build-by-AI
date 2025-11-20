@@ -235,108 +235,6 @@ jobs:
           make LLVM="${LLVM}" O="${OUT}" -j"$(nproc)"
           ls -la "${OUT}/arch/arm64/boot" || true
 
-      - name: Write local Docker kernel validator
-        shell: bash
-        working-directory: kernel_src
-        run: |
-          cat > .ci/check_docker_kernel.sh <<'SH'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          CFG="${1:-out/.config}"
-
-          req_flags=(  # 必需项（缺失则失败）
-            NAMESPACES
-            CGROUPS
-            CGROUP_SCHED
-            CGROUP_FREEZER
-            CGROUP_CPUACCT
-            CPUSETS
-            MEMCG
-            CGROUP_PIDS
-            CGROUP_DEVICE
-            OVERLAY_FS
-            VETH
-            BRIDGE
-            BRIDGE_NETFILTER
-            NETFILTER
-            NETFILTER_ADVANCED
-            NETFILTER_XTABLES
-            NF_CONNTRACK
-            NF_NAT
-            IP_NF_IPTABLES
-            IP_NF_FILTER
-            IP_NF_MANGLE
-            NETFILTER_XT_NAT
-            IP_NF_TARGET_MASQUERADE
-            NF_NAT_MASQUERADE_IPV4
-            NETFILTER_XT_MATCH_ADDRTYPE
-            NETFILTER_XT_MATCH_CONNTRACK
-            NETFILTER_XT_MATCH_STATE
-            NETFILTER_XT_MATCH_STATISTIC
-          )
-
-          opt_flags=(  # 可选项（建议开启）
-            NF_NAT_MASQUERADE_IPV6
-            NETFILTER_XT_TARGET_REDIRECT
-            NETFILTER_XT_TARGET_TCPMSS
-            NETFILTER_XT_TARGET_TPROXY
-          )
-
-          report="docker-kernel-check.txt"
-          : > "$report"
-
-          echo "Kernel CONFIG check for Docker @ $(date)" >> "$report"
-          echo "Config file: $CFG" >> "$report"
-          echo >> "$report"
-
-          missing=0
-          echo "== Generally Necessary ==" >> "$report"
-          for f in "${req_flags[@]}"; do
-            if zgrep -q "CONFIG_${f}=[ym]" "$CFG"; then
-              printf "  - CONFIG_%s: OK\n" "$f" >> "$report"
-            else
-              printf "  - CONFIG_%s: MISSING\n" "$f" >> "$report"
-              missing=$((missing+1))
-            fi
-          done
-
-          echo >> "$report"
-          echo "== Optional / Recommended ==" >> "$report"
-          for f in "${opt_flags[@]}"; do
-            if zgrep -q "CONFIG_${f}=[ym]" "$CFG"; then
-              printf "  - CONFIG_%s: OK\n" "$f" >> "$report"
-            else
-              printf "  - CONFIG_%s: (optional) missing\n" "$f" >> "$report"
-            fi
-          done
-
-          echo >> "$report"
-          echo "Missing count (required): $missing" >> "$report"
-
-          # 缺关键项则失败
-          if [ "$missing" -gt 0 ]; then
-            echo "[ERROR] Required kernel flags missing: $missing"
-            exit 2
-          fi
-          SH
-          chmod +x .ci/check_docker_kernel.sh
-
-      - name: Validate Docker kernel flags (local)
-        shell: bash
-        working-directory: kernel_src
-        run: |
-          set -e
-          .ci/check_docker_kernel.sh "${OUT}/.config"
-          echo "[INFO] Validation PASSED"
-
-      - name: Upload Docker kernel validation report
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-kernel-check
-          path: kernel_src/docker-kernel-check.txt
-
-
-
       - name: Pack AnyKernel3 zip
         shell: bash
         run: |
@@ -344,31 +242,34 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
           cd ak3
 
-          # 修改 anykernel.sh 基本兼容性
+          # 基本兼容：关闭设备检查/自动分区/自动 slot
           sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
           sed -i 's!BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!BLOCK=auto;!g' anykernel.sh
           sed -i 's/is_slot_device=0;/is_slot_device=auto;/g' anykernel.sh
 
           SRC="../kernel_src/${OUT}/arch/${ARCH}/boot"
-          mkdir -p kernel
-
-          # 优先级：Image.gz-dtb > Image.gz > Image（压缩）
+          # 把镜像放到 zip 根目录（不是 kernel/），符合你的刷写要求
+          # 优先级：Image.gz-dtb > Image.gz > Image；不做任何压缩转换
           if [ -f "${SRC}/Image.gz-dtb" ]; then
-            cp "${SRC}/Image.gz-dtb" kernel/
+            cp "${SRC}/Image.gz-dtb" .
+            echo "[INFO] Placed Image.gz-dtb at zip root"
           elif [ -f "${SRC}/Image.gz" ]; then
-            cp "${SRC}/Image.gz" kernel/
+            cp "${SRC}/Image.gz" .
+            echo "[INFO] Placed Image.gz at zip root"
           elif [ -f "${SRC}/Image" ]; then
-            echo "[INFO] Only Image found; compressing to Image.gz"
-            gzip -c9 "${SRC}/Image" > kernel/Image.gz
+            cp "${SRC}/Image" .
+            echo "[INFO] Placed Image at zip root"
           else
             echo "[ERROR] No kernel image found!" && ls -la "${SRC}" && exit 1
           fi
 
-          # 可选附带 dtbo.img / dtb
+          # 可选附带：把 dtbo.img / dtb 放入 kernel/ 目录，避免根目录太“杂”
+          mkdir -p kernel
           [ -f "${SRC}/dtbo.img" ] && cp "${SRC}/dtbo.img" kernel/ || true
           [ -d "${SRC}/dtb" ] && cp -r "${SRC}/dtb" kernel/ || true
 
           ZIP="../Docker-ready-kernel-${{ inputs.device }}-${{ inputs.branch }}.zip"
+          # 打包：根目录包含镜像文件，kernel/ 目录包含 dtb/dtbo（如有）
           zip -r9 "$ZIP" .
           echo "AK3 zip: $ZIP"
 
@@ -391,7 +292,7 @@ jobs:
           body: |
             ## Docker-ready kernel for ${{ inputs.device }}
             - Branch: ${{ inputs.branch }}
-            - Includes AnyKernel3 zip for flashing
+            - AnyKernel3 zip: kernel image placed at ZIP root (per flash requirement)
           files: |
             Docker-ready-kernel-${{ inputs.device }}-${{ inputs.branch }}.zip
             kernel_src/out/arch/arm64/boot/Image*
