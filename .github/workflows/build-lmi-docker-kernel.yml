@@ -255,5 +255,3 @@ jobs:
             Docker-ready-kernel-${{ inputs.device }}-${{ inputs.branch }}.zip
             kernel_src/out/arch/arm64/boot/Image*
             kernel_src/out/.config
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
