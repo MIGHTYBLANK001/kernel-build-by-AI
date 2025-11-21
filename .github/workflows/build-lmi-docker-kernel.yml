@@ -1,4 +1,4 @@
-name: Build Docker+Android kernel (SM8250/lmi) with AnyKernel3 - v4.2
+name: Build Docker+Android kernel (SM8250/lmi) with AnyKernel3 - v4.1
 
 on:
   workflow_dispatch:
@@ -12,13 +12,9 @@ on:
         required: true
         default: "android15-lineage22-mod"
       device:
-        description: "Device codename (for AK3 device check only)"
+        description: "Device codename"
         required: true
         default: "lmi"
-      defconfig_name:
-        description: "Exact defconfig filename under arch/arm64/configs/"
-        required: true
-        default: "lmi_defconfig"
       release_tag:
         description: "Release tag (auto if empty)"
         required: false
@@ -74,6 +70,7 @@ jobs:
             llvm-15-tools \
             binutils-aarch64-linux-gnu \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          # unsuffixed symlinks for CC/LD; other llvm-* use LLVM=-15
           sudo ln -sf /usr/bin/clang-15 /usr/bin/clang
           sudo ln -sf /usr/bin/ld.lld-15 /usr/bin/ld.lld
           sudo ln -sf /usr/bin/llvm-objdump-15 /usr/bin/llvm-objdump
@@ -134,26 +131,35 @@ jobs:
           fi
 
       ########################################################################
-      # CONFIGURATION — use EXACT defconfig name from inputs
+      # CONFIGURATION — defconfig + force-enable Docker & Android compat
       ########################################################################
-      - name: Validate defconfig_name exists (arch/arm64/configs/${{ inputs.defconfig_name }})
+      - name: Select and validate defconfig (prefer ${device}_defconfig; fallback to lmi_defconfig)
         working-directory: kernel_src
         run: |
           set -e
-          DEF="arch/arm64/configs/${{ inputs.defconfig_name }}"
-          echo "[INFO] Required defconfig: $DEF"
-          if [ ! -f "$DEF" ]; then
-            echo "[ERROR] $DEF not found. Please make sure the repository contains it."
-            exit 1
-          fi
-          echo "$DEF" > ../DEFCONFIG_PATH.txt
+          DEFCONFIG_CAND="arch/arm64/configs/${{ inputs.device }}_defconfig"
+          FALLBACK_DEFCONFIG="arch/arm64/configs/lmi_defconfig"
 
-      - name: Prepare .config from specified defconfig
+          echo "[INFO] Preferred defconfig: $DEFCONFIG_CAND"
+          if [ -f "$DEFCONFIG_CAND" ]; then
+            echo "[INFO] Using device defconfig: $DEFCONFIG_CAND"
+            echo "$DEFCONFIG_CAND" > ../DEFCONFIG_PATH.txt
+          else
+            echo "[WARN] $DEFCONFIG_CAND not found; fallback to $FALLBACK_DEFCONFIG"
+            if [ ! -f "$FALLBACK_DEFCONFIG" ]; then
+              echo "[ERROR] Fallback defconfig ($FALLBACK_DEFCONFIG) not found. Abort."
+              exit 1
+            fi
+            echo "$FALLBACK_DEFCONFIG" > ../DEFCONFIG_PATH.txt
+          fi
+
+      - name: Prepare .config from selected defconfig
         working-directory: kernel_src
         run: |
           set -e
           DEFCONFIG_PATH="$(cat ../DEFCONFIG_PATH.txt)"
-          echo "[INFO] Using defconfig: $DEFCONFIG_PATH"
+          echo "[INFO] Final defconfig path: $DEFCONFIG_PATH"
+
           mkdir -p ${OUT}
           export ARCH=arm64
           export SUBARCH=arm64
@@ -161,7 +167,7 @@ jobs:
           export LD=ld.lld
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CLANG_TRIPLE=aarch64-linux-gnu-
-          # 明确调用 defconfig 名称（basename），确保严格使用指定机型配置
+          # 通过明确路径调用 defconfig，确保使用指定机型配置
           make LLVM=${LLVM} O=${OUT} ARCH=${ARCH} $(basename "$DEFCONFIG_PATH")
           make LLVM=${LLVM} O=${OUT} ARCH=${ARCH} scripts
 
@@ -203,7 +209,7 @@ jobs:
           # overlayfs
           enable_y CONFIG_OVERLAY_FS
 
-          # Netfilter / iptables + xt matches
+          # Netfilter / iptables (IPv4/IPv6) + xt matches
           for K in VETH BRIDGE BRIDGE_NETFILTER NETFILTER NETFILTER_XTABLES \
                    NF_CONNTRACK NF_NAT \
                    IP_NF_IPTABLES IP_NF_FILTER IP_NF_MANGLE IP_NF_RAW IP_NF_SECURITY IP_NF_TARGET_MASQUERADE \
@@ -229,7 +235,7 @@ jobs:
           # IPVS
           for K in IP_VS IP_VS_NFCT IP_VS_PROTO_TCP IP_VS_PROTO_UDP IP_VS_RR; do enable_y CONFIG_${K}; done
 
-          # 网络驱动
+          # 网络驱动（overlay/macvlan/ipvlan/VLAN）
           enable_y CONFIG_VXLAN
           enable_y CONFIG_BRIDGE_VLAN_FILTERING
           enable_y CONFIG_IPVLAN
@@ -245,15 +251,23 @@ jobs:
 
           # === Android-compat profile ===
           if [ "${{ inputs.android_compat }}" = "true" ]; then
+            # SELinux & Audit（Android 必需）
             enable_y CONFIG_SECURITY_SELINUX
             enable_y CONFIG_AUDIT
+
+            # Android Vendor Hooks
             enable_y CONFIG_ANDROID_VENDOR_HOOKS
+
+            # FUSE（Android 文件系统栈）
             enable_y CONFIG_FUSE_FS
+
+            # 模块能力（Android 要求）
             enable_y CONFIG_MODULES
             enable_y CONFIG_MODULE_UNLOAD
             enable_y CONFIG_MODVERSIONS
           fi
 
+          # 生成最终 .config
           make LLVM=${LLVM} O=${OUT} ARCH=${ARCH} olddefconfig
 
           echo "[INFO] Key configs in final .config:"
@@ -329,7 +343,7 @@ jobs:
         run: |
           set -e
           cd AK3
-          zip -r9 ../lmi-kernel-ak3-v4.2.zip ./*
+          zip -r9 ../lmi-kernel-ak3-v4.1.zip ./*
 
       ########################################################################
       # ARTIFACTS & RELEASE
@@ -337,11 +351,11 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: lmi-kernel-android-ak3-v4.2
+          name: lmi-kernel-android-ak3-v4.1
           path: |
             kernel_src/out/arch/arm64/boot/Image*
             kernel_src/out/.config
-            lmi-kernel-ak3-v4.2.zip
+            lmi-kernel-ak3-v4.1.zip
 
       - name: Prepare Release metadata
         id: meta
@@ -349,20 +363,20 @@ jobs:
           set -e
           DATE=$(date +'%Y%m%d')
           if [ -z "${{ inputs.release_tag }}" ]; then
-            TAG="lmi-kernel-android-ak3-${{ inputs.branch }}-${DATE}-v4.2"
+            TAG="lmi-kernel-android-ak3-${{ inputs.branch }}-${DATE}-v4.1"
           else
             TAG="${{ inputs.release_tag }}"
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "name=Docker+Android kernel (AK3) for lmi (${TAG})" >> $GITHUB_OUTPUT
           echo "body=\
-          ## Docker+Android kernel for lmi — v4.2\\n\
+          ## Docker+Android kernel for lmi — v4.1\\n\
           - Repo: ${{ inputs.repo_url }}\\n\
           - Branch: ${{ inputs.branch }}\\n\
-          - Defconfig: arch/arm64/configs/${{ inputs.defconfig_name }}\\n\
+          - Defconfig: arch/arm64/configs/${{ inputs.device }}_defconfig (fallback lmi_defconfig)\\n\
           - Patches: cgroup.patch (required) + xt_qtaguid.patch (conditional)\\n\
           - Packaging: AnyKernel3 flashable zip (Image.gz-dtb in zip root; inject into boot)\\n\
-          - Notes: AK3 keeps ramdisk/cmdline unchanged; recommended for crDroid/Lineage系 ROM 兼容\\n\
+          - Notes: Uses AK3 template; keep ramdisk/cmdline unchanged for best ROM compatibility\\n\
           " >> $GITHUB_OUTPUT
 
       - name: Create Release and upload assets
@@ -376,5 +390,6 @@ jobs:
           files: |
             kernel_src/out/arch/arm64/boot/Image*
             kernel_src/out/.config
-            lmi-kernel-ak3-v4.2.zip
+            lmi-kernel-ak3-v4.1.zip
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
