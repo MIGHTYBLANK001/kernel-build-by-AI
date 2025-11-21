@@ -289,3 +289,5 @@ jobs:
             kernel_src/out/.config
             lmi-kernel-ak3-min-v4.1.4.zip
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
