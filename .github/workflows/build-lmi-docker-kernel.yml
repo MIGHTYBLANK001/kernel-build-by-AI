@@ -1,4 +1,4 @@
-name: Build Docker+Android kernel (SM8250/lmi) with AnyKernel3 - v4.1
+name: Build Docker+Android kernel (SM8250/lmi) with AnyKernel3 - v4.1.1
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
         required: true
         default: "android15-lineage22-mod"
       device:
-        description: "Device codename"
+        description: "Device codename (for AK3 device check only)"
         required: true
         default: "lmi"
       release_tag:
@@ -70,7 +70,6 @@ jobs:
             llvm-15-tools \
             binutils-aarch64-linux-gnu \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          # unsuffixed symlinks for CC/LD; other llvm-* use LLVM=-15
           sudo ln -sf /usr/bin/clang-15 /usr/bin/clang
           sudo ln -sf /usr/bin/ld.lld-15 /usr/bin/ld.lld
           sudo ln -sf /usr/bin/llvm-objdump-15 /usr/bin/llvm-objdump
@@ -133,33 +132,10 @@ jobs:
       ########################################################################
       # CONFIGURATION — defconfig + force-enable Docker & Android compat
       ########################################################################
-      - name: Select and validate defconfig (prefer ${device}_defconfig; fallback to lmi_defconfig)
+      - name: Prepare .config from defconfig (lmi_defconfig)
         working-directory: kernel_src
         run: |
           set -e
-          DEFCONFIG_CAND="arch/arm64/configs/${{ inputs.device }}_defconfig"
-          FALLBACK_DEFCONFIG="arch/arm64/configs/lmi_defconfig"
-
-          echo "[INFO] Preferred defconfig: $DEFCONFIG_CAND"
-          if [ -f "$DEFCONFIG_CAND" ]; then
-            echo "[INFO] Using device defconfig: $DEFCONFIG_CAND"
-            echo "$DEFCONFIG_CAND" > ../DEFCONFIG_PATH.txt
-          else
-            echo "[WARN] $DEFCONFIG_CAND not found; fallback to $FALLBACK_DEFCONFIG"
-            if [ ! -f "$FALLBACK_DEFCONFIG" ]; then
-              echo "[ERROR] Fallback defconfig ($FALLBACK_DEFCONFIG) not found. Abort."
-              exit 1
-            fi
-            echo "$FALLBACK_DEFCONFIG" > ../DEFCONFIG_PATH.txt
-          fi
-
-      - name: Prepare .config from selected defconfig
-        working-directory: kernel_src
-        run: |
-          set -e
-          DEFCONFIG_PATH="$(cat ../DEFCONFIG_PATH.txt)"
-          echo "[INFO] Final defconfig path: $DEFCONFIG_PATH"
-
           mkdir -p ${OUT}
           export ARCH=arm64
           export SUBARCH=arm64
@@ -167,8 +143,7 @@ jobs:
           export LD=ld.lld
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CLANG_TRIPLE=aarch64-linux-gnu-
-          # 通过明确路径调用 defconfig，确保使用指定机型配置
-          make LLVM=${LLVM} O=${OUT} ARCH=${ARCH} $(basename "$DEFCONFIG_PATH")
+          make LLVM=${LLVM} O=${OUT} ARCH=${ARCH} lmi_defconfig
           make LLVM=${LLVM} O=${OUT} ARCH=${ARCH} scripts
 
       - name: Force-enable Docker configs + Android-compat profile
@@ -209,7 +184,7 @@ jobs:
           # overlayfs
           enable_y CONFIG_OVERLAY_FS
 
-          # Netfilter / iptables (IPv4/IPv6) + xt matches
+          # Netfilter / iptables + xt matches
           for K in VETH BRIDGE BRIDGE_NETFILTER NETFILTER NETFILTER_XTABLES \
                    NF_CONNTRACK NF_NAT \
                    IP_NF_IPTABLES IP_NF_FILTER IP_NF_MANGLE IP_NF_RAW IP_NF_SECURITY IP_NF_TARGET_MASQUERADE \
@@ -235,7 +210,7 @@ jobs:
           # IPVS
           for K in IP_VS IP_VS_NFCT IP_VS_PROTO_TCP IP_VS_PROTO_UDP IP_VS_RR; do enable_y CONFIG_${K}; done
 
-          # 网络驱动（overlay/macvlan/ipvlan/VLAN）
+          # 网络驱动
           enable_y CONFIG_VXLAN
           enable_y CONFIG_BRIDGE_VLAN_FILTERING
           enable_y CONFIG_IPVLAN
@@ -251,23 +226,15 @@ jobs:
 
           # === Android-compat profile ===
           if [ "${{ inputs.android_compat }}" = "true" ]; then
-            # SELinux & Audit（Android 必需）
             enable_y CONFIG_SECURITY_SELINUX
             enable_y CONFIG_AUDIT
-
-            # Android Vendor Hooks
             enable_y CONFIG_ANDROID_VENDOR_HOOKS
-
-            # FUSE（Android 文件系统栈）
             enable_y CONFIG_FUSE_FS
-
-            # 模块能力（Android 要求）
             enable_y CONFIG_MODULES
             enable_y CONFIG_MODULE_UNLOAD
             enable_y CONFIG_MODVERSIONS
           fi
 
-          # 生成最终 .config
           make LLVM=${LLVM} O=${OUT} ARCH=${ARCH} olddefconfig
 
           echo "[INFO] Key configs in final .config:"
@@ -282,9 +249,9 @@ jobs:
           /tmp/check-config.sh ${OUT}/.config || true
 
       ########################################################################
-      # BUILD — kernel (Image.gz-dtb)
+      # BUILD — kernel (Image)
       ########################################################################
-      - name: Build kernel (Image.gz / Image.gz-dtb)
+      - name: Build kernel (plain Image)
         working-directory: kernel_src
         run: |
           set -e
@@ -296,10 +263,11 @@ jobs:
           export CLANG_TRIPLE=aarch64-linux-gnu-
           make LLVM=${LLVM} O=${OUT} -j$(nproc)
           ls -la ${OUT}/arch/arm64/boot || true
-          test -f ${OUT}/arch/arm64/boot/Image.gz-dtb
+          # ✅ 验证未压缩 Image 存在
+          test -f ${OUT}/arch/arm64/boot/Image
 
       ########################################################################
-      # PACKAGE — AnyKernel3 flashable zip (image置于包根目录)
+      # PACKAGE — AnyKernel3 flashable zip (Image置于包根目录；注入boot)
       ########################################################################
       - name: Prepare AnyKernel3 template
         run: |
@@ -322,28 +290,31 @@ jobs:
           }
           . tools/ak3-core.sh
           patch_bootimage() {
-            ui_print "Injecting Image.gz-dtb into boot..."
+            ui_print "Injecting plain Image into boot..."
             split_boot
-            if [ ! -f "$ZIPFILEDIR/Image.gz-dtb" ]; then
-              abort "Image.gz-dtb not found in zip root"
+            if [ ! -f "$ZIPFILEDIR/Image" ]; then
+              abort "Image not found in zip root"
             fi
-            cp -f "$ZIPFILEDIR/Image.gz-dtb" kernel
+            # 替换 kernel（magiskboot 自动处理头/签名；无需 gz 或附带 dtb）
+            cp -f "$ZIPFILEDIR/Image" kernel
             flash_boot
           }
           install() { patch_bootimage; }
           EOF
           chmod +x AK3/anykernel.sh
 
-      - name: Copy kernel image into AK3 root
+      - name: Copy kernel Image into AK3 root
         run: |
           set -e
-          cp -f kernel_src/out/arch/arm64/boot/Image.gz-dtb AK3/Image.gz-dtb
+          cp -f kernel_src/out/arch/arm64/boot/Image AK3/Image
+          # 可选：保留 dtbo.img（不刷），便于调试或人工比对
+          cp -f kernel_src/out/arch/arm64/boot/dtbo.img AK3/dtbo.img || true
 
       - name: Make flashable zip (AK3)
         run: |
           set -e
           cd AK3
-          zip -r9 ../lmi-kernel-ak3-v4.1.zip ./*
+          zip -r9 ../lmi-kernel-ak3-v4.1.1.zip ./*
 
       ########################################################################
       # ARTIFACTS & RELEASE
@@ -351,11 +322,12 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: lmi-kernel-android-ak3-v4.1
+          name: lmi-kernel-android-ak3-v4.1.1
           path: |
-            kernel_src/out/arch/arm64/boot/Image*
+            kernel_src/out/arch/arm64/boot/Image
+            kernel_src/out/arch/arm64/boot/dtbo.img
             kernel_src/out/.config
-            lmi-kernel-ak3-v4.1.zip
+            lmi-kernel-ak3-v4.1.1.zip
 
       - name: Prepare Release metadata
         id: meta
@@ -363,20 +335,19 @@ jobs:
           set -e
           DATE=$(date +'%Y%m%d')
           if [ -z "${{ inputs.release_tag }}" ]; then
-            TAG="lmi-kernel-android-ak3-${{ inputs.branch }}-${DATE}-v4.1"
+            TAG="lmi-kernel-android-ak3-${{ inputs.branch }}-${DATE}-v4.1.1"
           else
             TAG="${{ inputs.release_tag }}"
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "name=Docker+Android kernel (AK3) for lmi (${TAG})" >> $GITHUB_OUTPUT
           echo "body=\
-          ## Docker+Android kernel for lmi — v4.1\\n\
+          ## Docker+Android kernel for lmi — v4.1.1\\n\
           - Repo: ${{ inputs.repo_url }}\\n\
           - Branch: ${{ inputs.branch }}\\n\
-          - Defconfig: arch/arm64/configs/${{ inputs.device }}_defconfig (fallback lmi_defconfig)\\n\
-          - Patches: cgroup.patch (required) + xt_qtaguid.patch (conditional)\\n\
-          - Packaging: AnyKernel3 flashable zip (Image.gz-dtb in zip root; inject into boot)\\n\
-          - Notes: Uses AK3 template; keep ramdisk/cmdline unchanged for best ROM compatibility\\n\
+          - Defconfig: lmi_defconfig\\n\
+          - Packaging: AnyKernel3 flashable zip (plain Image in zip root; inject into boot)\\n\
+          - Note: DTBO remains untouched; device-specific DTB/DTBO handled by original ROM/vendor_boot\\n\
           " >> $GITHUB_OUTPUT
 
       - name: Create Release and upload assets
@@ -388,8 +359,9 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            kernel_src/out/arch/arm64/boot/Image*
+            kernel_src/out/arch/arm64/boot/Image
+            kernel_src/out/arch/arm64/boot/dtbo.img
             kernel_src/out/.config
-            lmi-kernel-ak3-v4.1.zip
+            lmi-kernel-ak3-v4.1.1.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
