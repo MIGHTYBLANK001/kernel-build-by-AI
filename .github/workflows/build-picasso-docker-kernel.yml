@@ -1,11 +1,11 @@
 
-name: Build kernel (picasso/AOSP) – clean run (no caches) + release (no KernelSU)
+name: Build kernel (picasso/AOSP) – version-aware toolchain (no KernelSU)
 
 on:
   workflow_dispatch:
     inputs:
       kernel_branch:
-        description: "要构建的分支；留空则使用默认分支"
+        description: "要构建的分支；留空=默认分支"
         default: ""
         required: false
 
@@ -19,9 +19,7 @@ jobs:
     env:
       TARGET_DEVICE: picasso
       BUILD_AOSP: "1"
-      TOOLCHAIN_ROOT: ${{ github.workspace }}/../proton-clang
-      TOOLCHAIN_VERSION: "20210522"
-      TOOLCHAIN_PATH: ${{ github.workspace }}/../proton-clang/proton-clang-20210522/bin
+      TOOLCHAIN_ROOT: ${{ github.workspace }}/../aosp-clang
 
     steps:
       # 1) 检出工作流仓库
@@ -30,72 +28,8 @@ jobs:
         with:
           fetch-depth: 1
 
-      # 2) 安全命名（artifact 名称不含非法字符）
-      - name: Prepare safe names
-        id: names
-        shell: bash
-        run: |
-          set -e
-          SAFE_REPO="august-aosp-android_kernel_xiaomi_sm7250"
-          KBRANCH="${{ inputs.kernel_branch }}"
-          [[ -z "${KBRANCH}" ]] && KBRANCH="default"
-          echo "safe_repo=${SAFE_REPO}"  >> "$GITHUB_OUTPUT"
-          echo "safe_branch=${KBRANCH}" >> "$GITHUB_OUTPUT"
-
-      # 3) 拉取 Proton Clang（每次新拉取；无缓存）
-      - name: Fetch Proton Clang (fresh each run; no cache)
-        shell: bash
-        run: |
-          set -e
-          mkdir -p "${TOOLCHAIN_ROOT}"
-          git clone --depth=1 --branch "${TOOLCHAIN_VERSION}" https://github.com/kdrag0n/proton-clang \
-            "${TOOLCHAIN_ROOT}/proton-clang-${TOOLCHAIN_VERSION}"
-
-      # 4) 配置工具链
-      #    - 不前置 PATH（仅追加到末尾），避免旧 ld 覆盖系统 ld
-      #    - 目标内核显式使用 clang/ld.lld/llvm-*；主机侧用系统 gcc/g++
-      - name: Configure toolchains (system ld for host; explicit target tools)
-        shell: bash
-        run: |
-          set -e
-          # 追加，不覆盖系统 /usr/bin/ld
-          echo "PATH=$PATH:${TOOLCHAIN_PATH}"    >> "$GITHUB_ENV"
-
-          # 目标内核使用的 Clang/LLD/LLVM 工具（显式设置，避免 PATH 混用）
-          echo "CC=${TOOLCHAIN_PATH}/clang"       >> "$GITHUB_ENV"
-          echo "LD=${TOOLCHAIN_PATH}/ld.lld"      >> "$GITHUB_ENV"
-          echo "AR=${TOOLCHAIN_PATH}/llvm-ar"     >> "$GITHUB_ENV"
-          echo "NM=${TOOLCHAIN_PATH}/llvm-nm"     >> "$GITHUB_ENV"
-          echo "OBJCOPY=${TOOLCHAIN_PATH}/llvm-objcopy" >> "$GITHUB_ENV"
-          echo "STRIP=${TOOLCHAIN_PATH}/llvm-strip"     >> "$GITHUB_ENV"
-
-          # 主机侧始终用系统编译器/链接器（避免旧 ld 不识别 .relr.dyn）
-          echo "HOSTCC=gcc"                        >> "$GITHUB_ENV"
-          echo "HOSTCXX=g++"                       >> "$GITHUB_ENV"
-
-      - name: Show host & target toolchain versions
-        shell: bash
-        run: |
-          which gcc || true; gcc --version || true
-          which ld  || true; ld  --version || true
-          which clang  || true; clang  --version || true
-          which ld.lld || true; ld.lld --version || true
-          echo "CC=${CC}"; echo "LD=${LD}"
-
-      # 5) 安装基础依赖（不安装 ccache）
-      - name: Install build dependencies
-        shell: bash
-        run: |
-          set -e
-          sudo apt-get update
-          sudo apt-get install -y \
-            bc bison flex libssl-dev \
-            zip unzip git patch curl \
-            build-essential make \
-            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
-
-      # 6) 检出目标内核源码
-      - name: Checkout target kernel repo (specific branch) to kernel-src
+      # 2) 检出目标内核源码
+      - name: Checkout target kernel (specific branch)
         if: ${{ inputs.kernel_branch != '' }}
         uses: actions/checkout@v4
         with:
@@ -103,16 +37,14 @@ jobs:
           ref: ${{ inputs.kernel_branch }}
           path: kernel-src
           fetch-depth: 1
-          submodules: false
 
-      - name: Checkout target kernel repo (default branch) to kernel-src
+      - name: Checkout target kernel (default branch)
         if: ${{ inputs.kernel_branch == '' }}
         uses: actions/checkout@v4
         with:
           repository: august-aosp/android_kernel_xiaomi_sm7250
           path: kernel-src
           fetch-depth: 1
-          submodules: false
 
       - name: Clean working tree
         working-directory: kernel-src
@@ -121,7 +53,7 @@ jobs:
           git reset --hard HEAD
           git clean -fd
 
-      # 7) 预检 defconfig
+      # 3) 预检 defconfig
       - name: Preflight checks (vendor/picasso_defconfig)
         working-directory: kernel-src
         shell: bash
@@ -133,7 +65,7 @@ jobs:
             exit 1
           fi
 
-      # 8) 应用 LXC 补丁（远程下载）
+      # 4) （可选）应用 LXC 补丁 —— 保持你现有逻辑
       - name: Apply LXC patches from remote
         working-directory: kernel-src
         shell: bash
@@ -146,23 +78,20 @@ jobs:
           if ! grep -q 'source "utils/Kconfig"' Kconfig; then
             echo 'source "utils/Kconfig"' >> Kconfig
           fi
-
           DEFCONFIG="arch/arm64/configs/vendor/picasso_defconfig"
           if ! grep -q '^CONFIG_DOCKER=y' "${DEFCONFIG}"; then
             echo "CONFIG_DOCKER=y" >> "${DEFCONFIG}"
           fi
           sed -i '/CONFIG_ANDROID_PARANOID_NETWORK/d' "${DEFCONFIG}"
           echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> "${DEFCONFIG}"
-
           chmod +x utils/runcpatch.sh
           [[ -f kernel/cgroup/cgroup.c ]] && sh utils/runcpatch.sh kernel/cgroup/cgroup.c
           [[ -f kernel/cgroup.c       ]] && sh utils/runcpatch.sh kernel/cgroup.c
-
           if [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]]; then
             patch -p0 < utils/xt_qtaguid.patch || true
           fi
 
-      # 9) AnyKernel3
+      # 5) AnyKernel3
       - name: Prepare AnyKernel3
         working-directory: kernel-src
         shell: bash
@@ -171,8 +100,8 @@ jobs:
           rm -rf out/ anykernel/
           git clone --depth=1 https://github.com/liyafe1997/AnyKernel3 -b kona anykernel
 
-      # 10) defconfig 加版本戳
-      - name: Stamp local version in defconfig (vendor/picasso_defconfig)
+      # 6) 给 defconfig 打版本戳（仅字符串，不影响配置）
+      - name: Stamp local version in defconfig
         working-directory: kernel-src
         shell: bash
         run: |
@@ -180,41 +109,102 @@ jobs:
           GIT_COMMIT_ID="$(git rev-parse --short=8 HEAD)"
           sed -i "s/-perf/-$(date +%Y%m%d)-${GIT_COMMIT_ID}-perf/g" arch/arm64/configs/vendor/picasso_defconfig
 
-      # 11) **方式 A**：动态移除 KernelSU 引用（不包含 KernelSU）
+      # 7) 动态移除 KernelSU 引用（保持不含 KernelSU）
       - name: Drop KernelSU from Kconfig/defconfig (no kernelsu)
         working-directory: kernel-src
         shell: bash
         run: |
           set -e
-          # 删除 drivers/Kconfig 中的 source "drivers/kernelsu/Kconfig"（无论是否有前缀空格）
           if [[ -f drivers/Kconfig ]]; then
             sed -i 's|^[[:space:]]*source[[:space:]]*"drivers/kernelsu/Kconfig"[[:space:]]*$||' drivers/Kconfig || true
           fi
-
-          # 从 defconfig 中移除任何可能的 KernelSU 相关配置项（不同树命名可能不同）
           if [[ -f arch/arm64/configs/vendor/picasso_defconfig ]]; then
             sed -i '/^CONFIG_KERNELSU/d' arch/arm64/configs/vendor/picasso_defconfig || true
             sed -i '/^CONFIG_KERNEL_SU/d' arch/arm64/configs/vendor/picasso_defconfig || true
             sed -i '/^CONFIG_KSU/d'       arch/arm64/configs/vendor/picasso_defconfig || true
           fi
 
-          # 打印上下文（便于诊断）
-          echo ">>> drivers/Kconfig (context 200-260):"
-          nl -ba drivers/Kconfig | sed -n '200,260p' || true
-
-      # 12) 生成 defconfig（主机工具用系统 gcc/ld；目标用 clang/ld.lld）
-      - name: make vendor/picasso_defconfig
+      # 8) 解析 Makefile 得到内核版本（KERNELVERSION）
+      - name: Detect kernel version from Makefile (KERNELVERSION)
+        id: detectver
         working-directory: kernel-src
         shell: bash
         run: |
-          make O=out ARCH=arm64 SUBARCH=arm64 \
-               CC="${CC}" LD="${LD}" AR="${AR}" NM="${NM}" OBJCOPY="${OBJCOPY}" STRIP="${STRIP}" \
-               HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" \
-               CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
-               CLANG_TRIPLE=aarch64-linux-gnu- \
-               vendor/picasso_defconfig
+          set -e
+          MAJOR=$(awk '/^VERSION[[:space:]]*=/ {print $3}' Makefile)
+          MINOR=$(awk '/^PATCHLEVEL[[:space:]]*=/ {print $3}' Makefile)
+          SUBLV=$(awk '/^SUBLEVEL[[:space:]]*=/ {print $3}' Makefile)
+          EXTRA=$(awk '/^EXTRAVERSION[[:space:]]*=/ {print $3}' Makefile)
+          KV="${MAJOR}.${MINOR}.${SUBLV}${EXTRA}"
+          echo "kernel_version=${KV}" >> "$GITHUB_OUTPUT"
+          echo "Detected kernel version: ${KV}"
 
+      # 9) 根据版本选择 AOSP Clang 预编译版本
+      - name: Select AOSP Clang by kernel version
+        id: selectclang
+        shell: bash
+        run: |
+          set -e
+          KV="${{ steps.detectver.outputs.kernel_version }}"
+          MAJOR="${KV%%.*}"
+          REST="${KV#*.}"
+          MINOR="${REST%%.*}"
 
+          # 默认映射（可根据你的树微调）
+          if [[ "$MAJOR" -ge 6 ]]; then
+            CLANG_DIR="clang-r522817"   # Android 15 / 6.1
+          elif [[ "$MAJOR" -eq 5 && "$MINOR" -ge 15 ]]; then
+            CLANG_DIR="clang-r487747c"  # Android 14
+          elif [[ "$MAJOR" -eq 5 && "$MINOR" -eq 10 ]]; then
+            CLANG_DIR="clang-r416183b1" # Android 12
+          elif [[ "$MAJOR" -eq 4 && "$MINOR" -ge 19 ]]; then
+            CLANG_DIR="clang-r399163b"  # Android 11
+          else
+            CLANG_DIR="clang-r353983c"  # Android Q (老树)
+          fi
+
+          echo "clang_dir=${CLANG_DIR}" >> "$GITHUB_OUTPUT"
+          echo "Selected AOSP Clang: ${CLANG_DIR}"
+          # 说明：这些目录命名来自 AOSP Clang/LLVM 预编译仓库。参考官方 Readme。见注释与链接。
+
+      # 10) 拉取 AOSP Clang 预编译仓库（无缓存）
+      - name: Fetch AOSP Clang prebuilts
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "${TOOLCHAIN_ROOT}"
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 "${TOOLCHAIN_ROOT}/repo"
+          TOOLCHAIN_PATH="${TOOLCHAIN_ROOT}/repo/${{ steps.selectclang.outputs.clang_dir }}/bin"
+          echo "TOOLCHAIN_PATH=${TOOLCHAIN_PATH}" >> "$GITHUB_ENV"
+          echo "PATH=$PATH:${TOOLCHAIN_PATH}"     >> "$GITHUB_ENV"
+
+      # 11) 显示工具版本（Clang/ld.lld）
+      - name: Show selected toolchain versions
+        shell: bash
+        run: |
+          which clang || true; clang --version || true
+          which ld.lld || true; ld.lld --version || true
+
+      # 12) 不再改写 fair.c；若有改动，先还原
+      - name: Guard: restore kernel/sched/fair.c if modified
+        working-directory: kernel-src
+        shell: bash
+        run: |
+          set -e
+          if ! git restore --staged --worktree --quiet -- kernel/sched/fair.c 2>/dev/null; then
+            # 尝试 Worktree 还原
+            git checkout -- kernel/sched/fair.c || true
+          fi
+
+      # 13) 生成 defconfig（使用 LLVM=1 官方路径）
+      - name: make vendor/picasso_defconfig (LLVM=1)
+        working-directory: kernel-src
+        shell: bash
+        run: |
+          set -e
+          make LLVM=1 O=out ARCH=arm64 SUBARCH=arm64 vendor/picasso_defconfig
+
+      # 14) 精简调试选项（提速） + olddefconfig（不再用 yes 管道）
       - name: Speed-focused config tuning
         working-directory: kernel-src
         shell: bash
@@ -224,12 +214,9 @@ jobs:
             -d DEBUG_INFO \
             -d GDB_SCRIPTS \
             -d DEBUG_KERNEL
+          make LLVM=1 O=out ARCH=arm64 SUBARCH=arm64 olddefconfig
 
-          # olddefconfig 不会提示输入，直接运行即可；不要再用 `yes` 管道
-          make O=out ARCH=arm64 SUBARCH=arm64 olddefconfig
-
-
-      # 14) 容器内核项校验（moby 官方脚本）
+      # 15) 容器内核项校验（moby）
       - name: Verify Docker/LXC requirements via moby check-config.sh
         working-directory: kernel-src
         shell: bash
@@ -239,32 +226,13 @@ jobs:
           chmod +x /tmp/check-config.sh
           /tmp/check-config.sh out/.config
 
-      # 15) 兼容：自动改写 __state → state（按头文件实际情况）
-      - name: Adapt __state usages to current kernel (no heredoc)
-        working-directory: kernel-src
-        shell: bash
-        run: |
-          set -e
-          if ! grep -R -q '\b__state\b' include/linux/sched.h; then
-            echo "Detected task_struct.state (no __state); rewriting kernel/sched/fair.c ..."
-            sed -E -i 's/READ_ONCE\(\s*([[:alnum:]_.]+)->__state\s*\)/READ_ONCE(\1->state)/g' kernel/sched/fair.c
-            sed -E -i 's/\b([[:alnum:]_.]+)->__state\b/\1->state/g' kernel/sched/fair.c
-          else
-            echo "__state field present; no rewrite needed."
-          fi
-
-      # 16) 编译（保存完整日志）
+      # 16) 编译（LLVM=1；记录完整日志）
       - name: Build kernel (capture logs)
         working-directory: kernel-src
         shell: bash
         run: |
           set -e
-          make O=out ARCH=arm64 SUBARCH=arm64 \
-               CC="${CC}" LD="${LD}" AR="${AR}" NM="${NM}" OBJCOPY="${OBJCOPY}" STRIP="${STRIP}" \
-               HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" \
-               CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
-               CLANG_TRIPLE=aarch64-linux-gnu- \
-               -j"$(nproc)" 2>&1 | tee out/build.log
+          make LLVM=1 O=out ARCH=arm64 SUBARCH=arm64 -j"$(nproc)" 2>&1 | tee out/build.log
           [[ -f out/arch/arm64/boot/Image ]] || { echo "::error::未生成 out/arch/arm64/boot/Image（详见 out/build.log）"; exit 1; }
           echo "✅ Build OK: out/arch/arm64/boot/Image"
 
@@ -272,15 +240,14 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-${{ steps.names.outputs.safe_repo }}-${{ steps.names.outputs.safe_branch }}-picasso-aosp-${{ github.run_id }}
+          name: build-logs-picasso-aosp-${{ github.run_id }}
           path: |
             kernel-src/out/build.log
             kernel-src/out/.config
-            kernel-src/.config
           if-no-files-found: warn
 
       # 17) 生成 dtb
-      - name: Generate dtb (concatenate *.dtb)
+      - name: Generate dtb
         working-directory: kernel-src
         shell: bash
         run: |
@@ -301,7 +268,6 @@ jobs:
           (cd anykernel && zip -r9 "${ZIP_FILENAME}" ./* -x .git .gitignore out/ ./*.zip)
           mv anykernel/"${ZIP_FILENAME}" .
           echo "ZIP_FILENAME=${ZIP_FILENAME}" >> "$GITHUB_ENV"
-          echo "KERNEL_COMMIT=${GIT_COMMIT_ID}" >> "$GITHUB_ENV"
 
       - name: Restore defconfig local version string
         working-directory: kernel-src
@@ -313,40 +279,28 @@ jobs:
       - name: Upload artifacts (zip, Image, dtb)
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-${{ steps.names.outputs.safe_repo }}-${{ steps.names.outputs.safe_branch }}-picasso-aosp-${{ github.run_id }}
+          name: kernel-picasso-aosp-${{ github.run_id }}
           path: |
             kernel-src/${{ env.ZIP_FILENAME }}
-            kernel-src/anykernel/kernels/Image
-            kernel-src/anykernel/kernels/dtb
             kernel-src/out/arch/arm64/boot/Image
             kernel-src/out/arch/arm64/boot/dts/**/*.dtb
           if-no-files-found: warn
 
       # 20) 发布到 Release
-      - name: Prepare release tag/name
-        id: relmeta
-        shell: bash
-        run: |
-          set -e
-          TAG="picasso-aosp-${{ github.run_id }}-${{ github.run_number }}"
-          NAME="Kernel AOSP picasso (${TAG}) [kernel commit: ${KERNEL_COMMIT}]"
-          echo "tag=${TAG}"  >> "$GITHUB_OUTPUT"
-          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Create and push tag
+      - name: Create & push tag
         shell: bash
         run: |
           set -e
           git config user.name  "github-actions"
           git config user.email "github-actions@github.com"
-          git tag  "${{ steps.relmeta.outputs.tag }}"
-          git push origin "${{ steps.relmeta.outputs.tag }}"
+          TAG="picasso-aosp-${{ github.run_id }}-${{ github.run_number }}"
+          git tag  "${TAG}"
+          git push origin "${TAG}"
 
       - name: Create GitHub Release & upload AnyKernel ZIP
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.relmeta.outputs.tag }}
-          name:     ${{ steps.relmeta.outputs.name }}
+          tag_name: ${{ github.ref_name }}
           generate_release_notes: true
           files: |
             kernel-src/${{ env.ZIP_FILENAME }}
