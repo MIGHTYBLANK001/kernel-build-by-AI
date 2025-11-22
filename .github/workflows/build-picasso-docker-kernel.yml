@@ -1,252 +1,290 @@
 
-name: Build kernel (picasso/AOSP) – universal LLVM toolchain + auto-fallback (no KernelSU)
+name: Build Android Kernel (LLVM) + LXC Patches + AnyKernel3 + Release
 
 on:
   workflow_dispatch:
     inputs:
-      kernel_branch:
-        description: "要构建的分支；留空=默认分支"
-        default: ""
+      kernel_repo_url: https://github.com/august-aosp/android_kernel_xiaomi_sm7250
+        description: "内核源码仓库地址（例如 https://github.com/<org>/<repo>.git）"
+        required: true
+        type: string
+      kernel_branch: stable
+        description: "内核源码分支或标签（默认 main）"
+        required: true
+        type: string
+      device_codename: picasso
+        description: "机型代号（例如 'beryllium'、'xaga' 等）"
+        required: true
+        type: string
+      defconfig_path: vendor/picasso_defconfig
+        description: "defconfig 路径或文件名（如 'arch/arm64/configs/<codename>_defconfig' 或 '<codename>_defconfig'）"
+        required: true
+        type: string
+      arch:
+        description: "编译架构（默认 arm64）"
         required: false
+        default: "arm64"
+        type: string
+      llvm_version:
+        description: "LLVM/Clang 主版本（默认 20，可选 19/18…）"
+        required: false
+        default: "20"
+        type: string
+      anykernel3_repo:
+        description: "AnyKernel3 仓库（默认 osm0sis/AnyKernel3）"
+        required: false
+        default: "https://github.com/osm0sis/AnyKernel3.git"
+        type: string
+      anykernel3_branch:
+        description: "AnyKernel3 分支（默认 master）"
+        required: false
+        default: "master"
+        type: string
+      release_tag:
+        description: "发布用的标签（默认 auto-生成：ak3-<device>-<date>）"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  build-and-release:
     runs-on: ubuntu-latest
-
     env:
-      TARGET_DEVICE: picasso
-      BUILD_AOSP: "1"
-      TOOLCHAIN_ROOT: ${{ github.workspace }}/../aosp-clang
+      TZ: Asia/Shanghai
 
     steps:
-      # 1) 检出工作流仓库
-      - name: Checkout workflow repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+      - name: Checkout current repo
+        uses: actions/checkout@v5
 
-      # 2) 检出目标内核源码
-      - name: Checkout target kernel (specific branch)
-        if: ${{ inputs.kernel_branch != '' }}
-        uses: actions/checkout@v4
-        with:
-          repository: august-aosp/android_kernel_xiaomi_sm7250
-          ref: ${{ inputs.kernel_branch }}
-          path: kernel-src
-          fetch-depth: 1
-
-      - name: Checkout target kernel (default branch)
-        if: ${{ inputs.kernel_branch == '' }}
-        uses: actions/checkout@v4
-        with:
-          repository: august-aosp/android_kernel_xiaomi_sm7250
-          path: kernel-src
-          fetch-depth: 1
-
-      - name: Clean working tree
-        working-directory: kernel-src
-        shell: bash
+      - name: Show inputs
         run: |
-          git reset --hard HEAD
-          git clean -fd
+          echo "kernel_repo_url=${{ inputs.kernel_repo_url }}"
+          echo "kernel_branch=${{ inputs.kernel_branch }}"
+          echo "device_codename=${{ inputs.device_codename }}"
+          echo "defconfig_path=${{ inputs.defconfig_path }}"
+          echo "arch=${{ inputs.arch }}"
+          echo "llvm_version=${{ inputs.llvm_version }}"
+          echo "anykernel3_repo=${{ inputs.anykernel3_repo }}"
+          echo "anykernel3_branch=${{ inputs.anykernel3_branch }}"
 
-      # 3) 安装依赖（包含 GNU binutils；不安装 ccache）
       - name: Install build dependencies
-        shell: bash
         run: |
-          set -e
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison flex libssl-dev \
-            zip unzip git patch curl \
-            build-essential make \
-            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+            bc bison flex \
+            build-essential git curl wget zip unzip patch \
+            libssl-dev libelf-dev \
+            python3 rsync ccache \
+            dwarves lz4 llvm \
+            e2fsprogs util-linux
 
-      # 4) 拉取 AOSP Clang 预编译（统一版本）
-      - name: Fetch AOSP Clang prebuilts (clang-r547379)
-        shell: bash
+      - name: Install specific LLVM/Clang via apt.llvm.org
         run: |
-          set -e
-          mkdir -p "${TOOLCHAIN_ROOT}"
-          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 "${TOOLCHAIN_ROOT}/repo"
-          TOOLCHAIN_PATH="${TOOLCHAIN_ROOT}/repo/clang-r547379/bin"
-          echo "TOOLCHAIN_PATH=${TOOLCHAIN_PATH}" >> "$GITHUB_ENV"
-          echo "PATH=$PATH:${TOOLCHAIN_PATH}"     >> "$GITHUB_ENV"
+          set -eux
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh ${{ inputs.llvm_version }}
+          clang-${{ inputs.llvm_version }} --version || true
+          ld.lld-${{ inputs.llvm_version }} --version || true
 
-      - name: Show selected toolchain versions
-        shell: bash
+      - name: Clone kernel source
         run: |
-          which clang || true; clang --version || true
-          which ld.lld || true; ld.lld --version || true
+          set -eux
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo_url }}" kernel-src
 
-      # 5) AnyKernel3
-      - name: Prepare AnyKernel3
+      - name: Resolve defconfig path
+        id: defcfg
         working-directory: kernel-src
-        shell: bash
         run: |
-          set -e
-          rm -rf out/ anykernel/
-          git clone --depth=1 https://github.com/liyafe1997/AnyKernel3 -b kona anykernel
-
-      # 6) 给 defconfig 打版本戳（仅字符串）
-      - name: Stamp local version in defconfig
-        working-directory: kernel-src
-        shell: bash
-        run: |
-          set -e
-          GIT_COMMIT_ID="$(git rev-parse --short=8 HEAD)"
-          sed -i "s/-perf/-$(date +%Y%m%d)-${GIT_COMMIT_ID}-perf/g" arch/arm64/configs/vendor/picasso_defconfig
-
-      # 7) 动态移除 KernelSU 引用（保持不含 KernelSU）
-      - name: Drop KernelSU from Kconfig/defconfig (no kernelsu)
-        working-directory: kernel-src
-        shell: bash
-        run: |
-          set -e
-          if [[ -f drivers/Kconfig ]]; then
-            sed -i 's|^[[:space:]]*source[[:space:]]*"drivers/kernelsu/Kconfig"[[:space:]]*$||' drivers/Kconfig || true
+          set -eux
+          DF_IN="${{ inputs.defconfig_path }}"
+          ARCH_IN="${{ inputs.arch }}"
+          DF_TARGET="$(basename "$DF_IN")"
+          if [ -f "$DF_IN" ]; then
+            DF_PATH="$DF_IN"
+          else
+            DF_PATH="arch/${ARCH_IN}/configs/${DF_TARGET}"
           fi
-          if [[ -f arch/arm64/configs/vendor/picasso_defconfig ]]; then
-            sed -i '/^CONFIG_KERNELSU/d' arch/arm64/configs/vendor/picasso_defconfig || true
-            sed -i '/^CONFIG_KERNEL_SU/d' arch/arm64/configs/vendor/picasso_defconfig || true
-            sed -i '/^CONFIG_KSU/d'       arch/arm64/configs/vendor/picasso_defconfig || true
-          fi
+          echo "DF_TARGET=${DF_TARGET}" >> "$GITHUB_OUTPUT"
+          echo "DF_PATH=${DF_PATH}"     >> "$GITHUB_OUTPUT"
 
-
-      # 9) 生成 defconfig（使用 LLVM=1；Host 使用系统 gcc/g++）
-      - name: make vendor/picasso_defconfig (LLVM=1)
-        working-directory: kernel-src
-        shell: bash
+      #####################################################################
+      # 新增：创建 10G 工作空间（loopback ext4 挂载），用于 O= 输出目录
+      #####################################################################
+      - name: Prepare 10G build workspace (loopback ext4)
+        id: ws
         run: |
-          set -e
-          make LLVM=1 O=out ARCH=arm64 SUBARCH=arm64 \
-               HOSTCC=gcc HOSTCXX=g++ \
-               vendor/picasso_defconfig
+          set -eux
+          sudo mkdir -p /mnt/workspace
+          # 10G 稀疏镜像文件
+          sudo dd if=/dev/zero of=/mnt/workspace.img bs=1M count=0 seek=10240
+          sudo mkfs.ext4 -F /mnt/workspace.img
+          sudo mount -o loop /mnt/workspace.img /mnt/workspace
+          sudo chown $USER:$USER /mnt/workspace
+          mkdir -p /mnt/workspace/out
+          echo "O_OUT=/mnt/workspace/out" >> "$GITHUB_OUTPUT"
 
-      # 10) 精简调试选项（提速） + olddefconfig（不再用 yes 管道）
-      - name: Speed-focused config tuning
+      #####################################################################
+      # 新增：下载并应用 LXC 补丁
+      #####################################################################
+      - name: Fetch LXC_utils.zip
         working-directory: kernel-src
-        shell: bash
         run: |
-          set -e
-          scripts/config --file out/.config \
-            -d DEBUG_INFO \
-            -d GDB_SCRIPTS \
-            -d DEBUG_KERNEL
-          make LLVM=1 O=out ARCH=arm64 SUBARCH=arm64 olddefconfig
+          set -eux
+          mkdir -p Patchs
+          # 从你提供的地址下载补丁包
+          wget -O Patchs/LXC_utils.zip \
+            "https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/Patchs/LXC_utils.zip"
+          ls -l Patchs/LXC_utils.zip
 
-      # 11) 容器内核项校验（moby）
-      - name: Verify Docker/LXC requirements via moby check-config.sh
+      - name: Apply LXC patches (enable Docker, qtaguid, runcpatch)
         working-directory: kernel-src
-        shell: bash
-        run: |
-          set -e
-          curl -fsSL https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh -o /tmp/check-config.sh
-          chmod +x /tmp/check-config.sh
-          /tmp/check-config.sh out/.config
-
-      # 12) 编译：先 LLVM_IAS=1；失败则自动降级 LLVM_IAS=0 + GNU binutils
-      - name: Build kernel (universal toolchain with auto-fallback)
-        working-directory: kernel-src
-        shell: bash
+        env:
+          TARGET_DEVICE: ${{ inputs.device_codename }}
+          DF_PATH: ${{ steps.defcfg.outputs.DF_PATH }}
+          ARCH: ${{ inputs.arch }}
         run: |
           set -euo pipefail
+          echo "🔧 正在为内核安装 LXC 补丁..."
 
-          echo ">>> Attempt 1: LLVM=1 (integrated assembler ON)"
-          if make LLVM=1 O=out ARCH=arm64 SUBARCH=arm64 -j"$(nproc)" 2>&1 | tee out/build_attempt1.log; then
-            echo "✅ Build OK on attempt 1"
-          else
-            echo "⚠️ Attempt 1 failed. Retrying with LLVM_IAS=0 + GNU binutils ..."
-            # 清理最小化（避免残留）
-            make O=out ARCH=arm64 SUBARCH=arm64 clean
+          # 解压至 utils/
+          if [ ! -f "Patchs/LXC_utils.zip" ]; then
+            echo "⚠️ 未找到 Patchs/LXC_utils.zip，跳过 LXC 补丁步骤。" >&2
+            exit 0
+          fi
+          rm -rf utils && unzip -o Patchs/LXC_utils.zip -d utils
 
-            # 注意：当 LLVM_IAS=0 时，需要提供 CROSS_COMPILE 前缀找到非集成汇编器/objcopy 等（官方建议）：
-            # https://docs.kernel.org/kbuild/llvm.html
-            if make LLVM=1 LLVM_IAS=0 \
-                    O=out ARCH=arm64 SUBARCH=arm64 \
-                    CROSS_COMPILE=aarch64-linux-gnu- \
-                    CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-                    -j"$(nproc)" 2>&1 | tee out/build_attempt2.log; then
-              echo "✅ Build OK on attempt 2 (LLVM_IAS=0 + GNU binutils)"
-            else
-              echo "::error::Build failed on both attempts. See logs in out/."
-              exit 1
-            fi
+          # 将 utils/Kconfig 引入主 Kconfig
+          if ! grep -q 'source "utils/Kconfig"' Kconfig; then
+            echo 'source "utils/Kconfig"' >> Kconfig
           fi
 
-          [[ -f out/arch/arm64/boot/Image ]] || { echo "::error::未生成 out/arch/arm64/boot/Image"; exit 1; }
+          DEFCONFIG_FILE="$DF_PATH"
+          if [ ! -f "$DEFCONFIG_FILE" ]; then
+            echo "❌ 未找到 defconfig 文件：$DEFCONFIG_FILE" >&2
+            exit 1
+          fi
 
-      - name: Upload build logs & config (always)
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs-universal-${{ github.run_id }}
-          path: |
-            kernel-src/out/build_attempt1.log
-            kernel-src/out/build_attempt2.log
-            kernel-src/out/.config
-          if-no-files-found: warn
+          # 开启 Docker；关闭 ANDROID_PARANOID_NETWORK
+          if ! grep -q '^CONFIG_DOCKER=y' "$DEFCONFIG_FILE"; then
+            echo "CONFIG_DOCKER=y" >> "$DEFCONFIG_FILE"
+          fi
+          sed -i '/CONFIG_ANDROID_PARANOID_NETWORK/d' "$DEFCONFIG_FILE"
+          echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> "$DEFCONFIG_FILE"
 
-      # 13) 生成 dtb
-      - name: Generate dtb
+          # runcpatch：两个常见路径都尝试
+          chmod +x utils/runcpatch.sh
+          [ -f kernel/cgroup/cgroup.c ] && sh utils/runcpatch.sh kernel/cgroup/cgroup.c || true
+          [ -f kernel/cgroup.c ]       && sh utils/runcpatch.sh kernel/cgroup.c       || true
+
+          # xt_qtaguid 补丁（存在则尝试应用；失败不致命）
+          if [ -f net/netfilter/xt_qtaguid.c ] && [ -f utils/xt_qtaguid.patch ]; then
+            patch -p0 < utils/xt_qtaguid.patch || true
+          fi
+          echo "✅ LXC 补丁安装完成！"
+
+      - name: Build kernel (LLVM=${{ inputs.llvm_version }})
         working-directory: kernel-src
-        shell: bash
         run: |
-          set -e
-          find out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > out/arch/arm64/boot/dtb
+          set -eux
+          export ARCH="${{ inputs.arch }}"
+          export SUBARCH="${{ inputs.arch }}"
+          # 使用 10G 工作空间作为 O= 输出目录
+          make O="${{ steps.ws.outputs.O_OUT }}" ARCH="${ARCH}" LLVM=-${{ inputs.llvm_version }} "${{ steps.defcfg.outputs.DF_TARGET }}"
+          make -j"$(nproc)" O="${{ steps.ws.outputs.O_OUT }}" ARCH="${ARCH}" LLVM=-${{ inputs.llvm_version }}
 
-      # 14) 打包 AnyKernel3 刷写包
-      - name: Pack AnyKernel3 zip
+      - name: Build modules (optional)
         working-directory: kernel-src
-        shell: bash
         run: |
-          set -e
-          rm -rf anykernel/kernels/ && mkdir -p anykernel/kernels/
-          cp out/arch/arm64/boot/Image anykernel/kernels/
-          cp out/arch/arm64/boot/dtb    anykernel/kernels/
-          GIT_COMMIT_ID="$(git rev-parse --short=8 HEAD)"
-          ZIP_FILENAME="Kernel_AOSP_${TARGET_DEVICE}_UniversalLLVM_$(date +%Y%m%d_%H%M%S)_anykernel3_${GIT_COMMIT_ID}.zip"
-          (cd anykernel && zip -r9 "${ZIP_FILENAME}" ./* -x .git .gitignore out/ ./*.zip)
-          mv anykernel/"${ZIP_FILENAME}" .
-          echo "ZIP_FILENAME=${ZIP_FILENAME}" >> "$GITHUB_ENV"
+          set -eux
+          export ARCH="${{ inputs.arch }}"
+          make -j"$(nproc)" O="${{ steps.ws.outputs.O_OUT }}" ARCH="${ARCH}" LLVM=-${{ inputs.llvm_version }} modules || true
 
-      - name: Restore defconfig local version string
+      - name: Locate kernel images
+        id: locateimg
         working-directory: kernel-src
-        shell: bash
         run: |
-          git restore --source=HEAD -- arch/arm64/configs/vendor/picasso_defconfig || true
+          set -eux
+          ARCH_DIR="${{ steps.ws.outputs.O_OUT }}/arch/${{ inputs.arch }}/boot"
+          KIMG=$(ls ${ARCH_DIR}/Image*.lz4-dtb ${ARCH_DIR}/Image*.gz-dtb ${ARCH_DIR}/Image*-dtb ${ARCH_DIR}/Image.gz ${ARCH_DIR}/Image 2>/dev/null | head -n 1 || true)
+          DTBO=$(ls ${ARCH_DIR}/dtbo.img 2>/dev/null || true)
+          if [ -z "$KIMG" ]; then
+            echo "No kernel image found under ${ARCH_DIR}" >&2
+            exit 1
+          fi
+          echo "KIMG=$KIMG" >> $GITHUB_OUTPUT
+          echo "DTBO=$DTBO" >> $GITHUB_OUTPUT
 
-      # 15) 上传制品
-      - name: Upload artifacts (zip, Image, dtb)
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-universal-${{ github.run_id }}
-          path: |
-            kernel-src/${{ env.ZIP_FILENAME }}
-            kernel-src/out/arch/arm64/boot/Image
-            kernel-src/out/arch/arm64/boot/dts/**/*.dtb
-          if-no-files-found: warn
-
-      # 16) 打 tag + 发布到 Release（与之前一致）
-      - name: Create & push tag
-        shell: bash
+      - name: Clone AnyKernel3
         run: |
-          set -e
-          git config user.name  "github-actions"
-          git config user.email "github-actions@github.com"
-          TAG="picasso-aosp-universal-${{ github.run_id }}-${{ github.run_number }}"
-          git tag  "${TAG}"
-          git push origin "${TAG}"
+          set -eux
+          git clone --depth=1 -b "${{ inputs.anykernel3_branch }}" "${{ inputs.anykernel3_repo }}" AnyKernel3
 
-      - name: Create GitHub Release & upload AnyKernel ZIP
+      - name: Prepare AnyKernel3 payload
+        run: |
+          set -eux
+          cp "kernel-src/${{ steps.locateimg.outputs.KIMG }}" AnyKernel3/
+          if [ -n "${{ steps.locateimg.outputs.DTBO }}" ]; then
+            cp "kernel-src/${{ steps.locateimg.outputs.DTBO }}" AnyKernel3/
+          fi
+          if [ -d "${{ steps.ws.outputs.O_OUT }}/lib/modules" ]; then
+            mkdir -p AnyKernel3/modules
+            rsync -a "${{ steps.ws.outputs.O_OUT }}/lib/modules/" AnyKernel3/modules/ || true
+          fi
+
+      - name: Patch anykernel.sh
+        working-directory: AnyKernel3
+        run: |
+          set -eux
+          if grep -q '^kernel.string=' anykernel.sh; then
+            sed -i "s|^kernel.string=.*|kernel.string=Kernel for ${{ inputs.device_codename }} (LLVM ${{ inputs.llvm_version }})|" anykernel.sh
+          else
+            sed -i "1ikernel.string=Kernel for ${{ inputs.device_codename }} (LLVM ${{ inputs.llvm_version }})" anykernel.sh
+          fi
+          if grep -q '^device.name1=' anykernel.sh; then
+            sed -i "s|^device.name1=.*|device.name1=${{ inputs.device_codename }}|" anykernel.sh
+          else
+            sed -i "1idevice.name1=${{ inputs.device_codename }}" anykernel.sh
+          fi
+
+      - name: Make flashable ZIP
+        id: makezip
+        working-directory: AnyKernel3
+        run: |
+          set -eux
+          DATESTR="$(date +%Y%m%d-%H%M)"
+          ZIPNAME="AK3-${{ inputs.device_codename }}-${DATESTR}.zip"
+          zip -r9 "../${ZIPNAME}" .
+          echo "ZIPPATH=${ZIPNAME}" >> $GITHUB_OUTPUT
+
+      - name: Create Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          generate_release_notes: true
+          tag_name: ${{ inputs.release_tag != '' && inputs.release_tag || format('ak3-{0}-{1}', inputs.device_codename, steps.makezip.outputs.ZIPPATH) }}
+          name: "AnyKernel3 for ${{ inputs.device_codename }} (LLVM ${{ inputs.llvm_version }})"
+          body: |
+            - Device: ${{ inputs.device_codename }}
+            - Kernel repo: ${{ inputs.kernel_repo_url }} @ ${{ inputs.kernel_branch }}
+            - Defconfig: ${{ inputs.defconfig_path }}
+            - Arch: ${{ inputs.arch }}
+            - Toolchain: LLVM/Clang ${{ inputs.llvm_version }} via apt.llvm.org
+            - LXC patches: Docker enabled, runcpatch applied, xt_qtaguid patched (if present)
+            - Build workspace: 10G loopback ext4 mounted at /mnt/workspace
+            - Built at: ${{ env.TZ }}
+          draft: false
+          prerelease: false
           files: |
-            kernel-src/${{ env.ZIP_FILENAME }}
+            AnyKernel3/${{ steps.makezip.outputs.ZIPPATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # （可选清理）卸载工作空间，释放镜像文件
+      - name: Cleanup build workspace
+        if: always()
+        run: |
+          set -eux
+          sudo umount /mnt/workspace || true
+          sudo rm -f /mnt/workspace.img || true
