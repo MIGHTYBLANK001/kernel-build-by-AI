@@ -244,9 +244,9 @@ jobs:
           echo "✅ LXC 补丁安装完成！"
 
       # ===========================
-      # 目标构建（arm64）：启用 LLVM 集成汇编，避免宿主 /usr/bin/as
+      # 先只生成 .config（defconfig），再做兼容与配置修复
       # ===========================
-      - name: Build kernel (LLVM=${{ inputs.llvm_version }})
+      - name: Configure kernel (.config via defconfig)
         working-directory: kernel-src
         shell: bash
         run: |
@@ -258,6 +258,51 @@ jobs:
                CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
                HOSTCFLAGS="" HOSTLDFLAGS="" KCFLAGS="" \
                "${{ steps.defcfg.outputs.DF_TARGET }}"
+
+      # 打开 MMU_NOTIFIER（如该符号存在），使 mmu_notifier_range 等 API 可见
+      - name: Ensure MMU_NOTIFIER Kconfig enabled (if present)
+        working-directory: kernel-src
+        shell: bash
+        run: |
+          set -eux
+          if grep -Rqs "^config[[:space:]]\\+MMU_NOTIFIER\\b" . ; then
+            sed -i '/^CONFIG_MMU_NOTIFIER=/d' "${{ steps.ws.outputs.O_OUT }}/.config" || true
+            echo "CONFIG_MMU_NOTIFIER=y" >> "${{ steps.ws.outputs.O_OUT }}/.config"
+            make O="${{ steps.ws.outputs.O_OUT }}" olddefconfig
+          fi
+
+      # vm_fault 跨版本兼容：若结构体无 vma_flags/vma_page_prot，则移除 hugetlb.c 中两处定点初始化
+      - name: Compat fix: drop vm_fault .vma_flags/.vma_page_prot initializers if fields missing
+        working-directory: kernel-src
+        shell: bash
+        run: |
+          set -eux
+          HEADER="include/linux/mm_types.h"
+          NEED_FIX="false"
+          if [ -f "$HEADER" ]; then
+            if ! grep -q "vma_flags" "$HEADER" ; then NEED_FIX="true"; fi
+            if ! grep -q "vma_page_prot" "$HEADER" ; then NEED_FIX="true"; fi
+          else
+            NEED_FIX="true"
+          fi
+          if [ "$NEED_FIX" = "true" ]; then
+            echo "Applying minimal compat edits to mm/hugetlb.c (remove .vma_flags/.vma_page_prot initializers)"
+            sed -i 's/^[[:space:]]*\\.vma_flags[[:space:]]*=.*,//' mm/hugetlb.c || true
+            sed -i 's/^[[:space:]]*\\.vma_page_prot[[:space:]]*=.*,//' mm/hugetlb.c || true
+          else
+            echo "vm_fault includes vma_flags/vma_page_prot, no compat fix needed."
+          fi
+
+      # ===========================
+      # 目标构建（arm64）：启用 LLVM 集成汇编，避免宿主 /usr/bin/as
+      # ===========================
+      - name: Build kernel (compile)
+        working-directory: kernel-src
+        shell: bash
+        run: |
+          set -eux
+          export ARCH="${{ inputs.arch }}"
+          export SUBARCH="${{ inputs.arch }}"
           make -j"$(nproc)" O="${{ steps.ws.outputs.O_OUT }}" ARCH="${ARCH}" \
                LLVM=-${{ inputs.llvm_version }} LLVM_IAS=1 \
                CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -358,7 +403,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 清理：卸载工作空间，删除镜像文件
       - name: Cleanup build workspace
         if: always()
         shell: bash
