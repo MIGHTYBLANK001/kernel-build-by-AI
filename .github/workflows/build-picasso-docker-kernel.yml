@@ -50,7 +50,6 @@ on:
         default: ""
         type: string
 
-
 permissions:
   contents: write
 
@@ -64,7 +63,32 @@ jobs:
       - name: Checkout current repo
         uses: actions/checkout@v5
 
+      #####################################################################
+      # 在所有主要命令开始前：创建 10G 工作空间（loopback ext4），并供 O= 使用
+      #####################################################################
+      - name: Prepare 10G build workspace (loopback ext4)
+        id: ws
+        shell: bash
+        run: |
+          set -eux
+          # 若工具不存在则安装（避免 mkfs.ext4/mount 缺失）
+          if ! command -v mkfs.ext4 >/dev/null 2>&1 || ! command -v mount >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y e2fsprogs util-linux
+          fi
+
+          sudo mkdir -p /mnt/workspace
+          # 创建 10G 稀疏镜像文件并格式化为 ext4
+          sudo dd if=/dev/zero of=/mnt/workspace.img bs=1M count=0 seek=10240
+          sudo mkfs.ext4 -F /mnt/workspace.img
+          sudo mount -o loop /mnt/workspace.img /mnt/workspace
+          sudo chown $USER:$USER /mnt/workspace
+          mkdir -p /mnt/workspace/out
+
+          echo "O_OUT=/mnt/workspace/out" >> "$GITHUB_OUTPUT"
+
       - name: Show inputs
+        shell: bash
         run: |
           echo "kernel_repo_url=${{ inputs.kernel_repo_url }}"
           echo "kernel_branch=${{ inputs.kernel_branch }}"
@@ -76,17 +100,19 @@ jobs:
           echo "anykernel3_branch=${{ inputs.anykernel3_branch }}"
 
       - name: Install build dependencies
+        shell: bash
         run: |
+          set -eux
           sudo apt-get update
           sudo apt-get install -y \
             bc bison flex \
             build-essential git curl wget zip unzip patch \
             libssl-dev libelf-dev \
             python3 rsync ccache \
-            dwarves lz4 llvm \
-            e2fsprogs util-linux
+            dwarves lz4 llvm
 
       - name: Install specific LLVM/Clang via apt.llvm.org
+        shell: bash
         run: |
           set -eux
           wget https://apt.llvm.org/llvm.sh
@@ -96,6 +122,7 @@ jobs:
           ld.lld-${{ inputs.llvm_version }} --version || true
 
       - name: Clone kernel source
+        shell: bash
         run: |
           set -eux
           git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo_url }}" kernel-src
@@ -103,50 +130,57 @@ jobs:
       - name: Resolve defconfig path
         id: defcfg
         working-directory: kernel-src
+        shell: bash
+        env:
+          ARCH_IN: ${{ inputs.arch }}
         run: |
           set -eux
           DF_IN="${{ inputs.defconfig_path }}"
-          ARCH_IN="${{ inputs.arch }}"
-          DF_TARGET="$(basename "$DF_IN")"
+          DF_BASENAME="$(basename "$DF_IN")"
+
           if [ -f "$DF_IN" ]; then
             DF_PATH="$DF_IN"
           else
-            DF_PATH="arch/${ARCH_IN}/configs/${DF_TARGET}"
+            CANDIDATES=(
+              "arch/${ARCH_IN}/configs/${DF_BASENAME}"
+              "arch/${ARCH_IN}/configs/vendor/${DF_BASENAME}"
+              "vendor/${DF_BASENAME}"
+              "${DF_IN}"
+            )
+            DF_PATH=""
+            for p in "${CANDIDATES[@]}"; do
+              if [ -f "$p" ]; then
+                DF_PATH="$p"
+                break
+              fi
+            done
+            if [ -z "$DF_PATH" ]; then
+              echo "❌ 未找到 defconfig 文件，尝试过以下位置："
+              printf ' - %s\n' "${CANDIDATES[@]}"
+              exit 1
+            fi
           fi
-          echo "DF_TARGET=${DF_TARGET}" >> "$GITHUB_OUTPUT"
-          echo "DF_PATH=${DF_PATH}"     >> "$GITHUB_OUTPUT"
+
+          echo "DF_TARGET=${DF_BASENAME}" >> "$GITHUB_OUTPUT"
+          echo "DF_PATH=${DF_PATH}"       >> "$GITHUB_OUTPUT"
+          echo "✔ 解析到 defconfig：$DF_PATH"
 
       #####################################################################
-      # 新增：创建 10G 工作空间（loopback ext4 挂载），用于 O= 输出目录
-      #####################################################################
-      - name: Prepare 10G build workspace (loopback ext4)
-        id: ws
-        run: |
-          set -eux
-          sudo mkdir -p /mnt/workspace
-          # 10G 稀疏镜像文件
-          sudo dd if=/dev/zero of=/mnt/workspace.img bs=1M count=0 seek=10240
-          sudo mkfs.ext4 -F /mnt/workspace.img
-          sudo mount -o loop /mnt/workspace.img /mnt/workspace
-          sudo chown $USER:$USER /mnt/workspace
-          mkdir -p /mnt/workspace/out
-          echo "O_OUT=/mnt/workspace/out" >> "$GITHUB_OUTPUT"
-
-      #####################################################################
-      # 新增：下载并应用 LXC 补丁
+      # 下载并应用 LXC 补丁
       #####################################################################
       - name: Fetch LXC_utils.zip
         working-directory: kernel-src
+        shell: bash
         run: |
           set -eux
           mkdir -p Patchs
-          # 从你提供的地址下载补丁包
           wget -O Patchs/LXC_utils.zip \
             "https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/Patchs/LXC_utils.zip"
           ls -l Patchs/LXC_utils.zip
 
       - name: Apply LXC patches (enable Docker, qtaguid, runcpatch)
         working-directory: kernel-src
+        shell: bash
         env:
           TARGET_DEVICE: ${{ inputs.device_codename }}
           DF_PATH: ${{ steps.defcfg.outputs.DF_PATH }}
@@ -162,7 +196,7 @@ jobs:
           fi
           rm -rf utils && unzip -o Patchs/LXC_utils.zip -d utils
 
-          # 将 utils/Kconfig 引入主 Kconfig
+          # 引入 utils/Kconfig 到主 Kconfig（避免重复添加）
           if ! grep -q 'source "utils/Kconfig"' Kconfig; then
             echo 'source "utils/Kconfig"' >> Kconfig
           fi
@@ -180,7 +214,7 @@ jobs:
           sed -i '/CONFIG_ANDROID_PARANOID_NETWORK/d' "$DEFCONFIG_FILE"
           echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> "$DEFCONFIG_FILE"
 
-          # runcpatch：两个常见路径都尝试
+          # runcpatch：两条常见路径都尝试
           chmod +x utils/runcpatch.sh
           [ -f kernel/cgroup/cgroup.c ] && sh utils/runcpatch.sh kernel/cgroup/cgroup.c || true
           [ -f kernel/cgroup.c ]       && sh utils/runcpatch.sh kernel/cgroup.c       || true
@@ -189,10 +223,12 @@ jobs:
           if [ -f net/netfilter/xt_qtaguid.c ] && [ -f utils/xt_qtaguid.patch ]; then
             patch -p0 < utils/xt_qtaguid.patch || true
           fi
+
           echo "✅ LXC 补丁安装完成！"
 
       - name: Build kernel (LLVM=${{ inputs.llvm_version }})
         working-directory: kernel-src
+        shell: bash
         run: |
           set -eux
           export ARCH="${{ inputs.arch }}"
@@ -203,6 +239,7 @@ jobs:
 
       - name: Build modules (optional)
         working-directory: kernel-src
+        shell: bash
         run: |
           set -eux
           export ARCH="${{ inputs.arch }}"
@@ -211,6 +248,7 @@ jobs:
       - name: Locate kernel images
         id: locateimg
         working-directory: kernel-src
+        shell: bash
         run: |
           set -eux
           ARCH_DIR="${{ steps.ws.outputs.O_OUT }}/arch/${{ inputs.arch }}/boot"
@@ -224,11 +262,13 @@ jobs:
           echo "DTBO=$DTBO" >> $GITHUB_OUTPUT
 
       - name: Clone AnyKernel3
+        shell: bash
         run: |
           set -eux
           git clone --depth=1 -b "${{ inputs.anykernel3_branch }}" "${{ inputs.anykernel3_repo }}" AnyKernel3
 
       - name: Prepare AnyKernel3 payload
+        shell: bash
         run: |
           set -eux
           cp "kernel-src/${{ steps.locateimg.outputs.KIMG }}" AnyKernel3/
@@ -242,6 +282,7 @@ jobs:
 
       - name: Patch anykernel.sh
         working-directory: AnyKernel3
+        shell: bash
         run: |
           set -eux
           if grep -q '^kernel.string=' anykernel.sh; then
@@ -258,17 +299,19 @@ jobs:
       - name: Make flashable ZIP
         id: makezip
         working-directory: AnyKernel3
+        shell: bash
         run: |
           set -eux
           DATESTR="$(date +%Y%m%d-%H%M)"
           ZIPNAME="AK3-${{ inputs.device_codename }}-${DATESTR}.zip"
           zip -r9 "../${ZIPNAME}" .
           echo "ZIPPATH=${ZIPNAME}" >> $GITHUB_OUTPUT
+          echo "DATESTR=${DATESTR}" >> $GITHUB_OUTPUT
 
       - name: Create Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag != '' && inputs.release_tag || format('ak3-{0}-{1}', inputs.device_codename, steps.makezip.outputs.ZIPPATH) }}
+          tag_name: ${{ inputs.release_tag != '' && inputs.release_tag || format('ak3-{0}-{1}', inputs.device_codename, steps.makezip.outputs.DATESTR) }}
           name: "AnyKernel3 for ${{ inputs.device_codename }} (LLVM ${{ inputs.llvm_version }})"
           body: |
             - Device: ${{ inputs.device_codename }}
@@ -285,11 +328,3 @@ jobs:
             AnyKernel3/${{ steps.makezip.outputs.ZIPPATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # （可选清理）卸载工作空间，释放镜像文件
-      - name: Cleanup build workspace
-        if: always()
-        run: |
-          set -eux
-          sudo umount /mnt/workspace || true
-          sudo rm -f /mnt/workspace.img || true
