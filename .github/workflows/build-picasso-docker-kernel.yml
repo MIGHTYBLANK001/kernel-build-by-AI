@@ -214,7 +214,7 @@ jobs:
                CLANG_TRIPLE=aarch64-linux-gnu- \
                vendor/picasso_defconfig
 
-      # 13) 精简调试选项（提速）
+
       - name: Speed-focused config tuning
         working-directory: kernel-src
         shell: bash
@@ -224,7 +224,10 @@ jobs:
             -d DEBUG_INFO \
             -d GDB_SCRIPTS \
             -d DEBUG_KERNEL
-          yes "" | make O=out ARCH=arm64 SUBARCH=arm64 olddefconfig
+
+          # olddefconfig 不会提示输入，直接运行即可；不要再用 `yes` 管道
+          make O=out ARCH=arm64 SUBARCH=arm64 olddefconfig
+
 
       # 14) 容器内核项校验（moby 官方脚本）
       - name: Verify Docker/LXC requirements via moby check-config.sh
