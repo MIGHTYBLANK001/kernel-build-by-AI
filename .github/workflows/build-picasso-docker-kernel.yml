@@ -272,7 +272,7 @@ jobs:
           fi
 
       # vm_fault 跨版本兼容：若结构体无 vma_flags/vma_page_prot，则移除 hugetlb.c 中两处定点初始化
-      - name: Compat fix: drop vm_fault .vma_flags/.vma_page_prot initializers if fields missing
+      - name: Compat fix
         working-directory: kernel-src
         shell: bash
         run: |
