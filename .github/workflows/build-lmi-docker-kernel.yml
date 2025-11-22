@@ -1,5 +1,5 @@
 
-name: Build kernel (lmi/aosp, retain full script features)
+name: Build kernel (lmi/aosp, retain full script features, clone target repo first)
 
 on:
   workflow_dispatch:
@@ -16,6 +16,10 @@ on:
         description: "是否启用 SukiSU/KernelSU 补丁（第三参数传入 ksu）"
         default: "false"
         required: true
+      kernel_branch:
+        description: "要构建的内核分支（留空则使用默认分支）"
+        default: ""
+        required: false
 
   # 如需在默认分支 push 时也触发，取消注释并把分支名改成你的默认分支（如 main 或 master）
   # push:
@@ -31,21 +35,33 @@ jobs:
       CCACHE_DIR: ${{ github.workspace }}/../.cache/ccache_mikernel
 
     steps:
-      - name: Checkout kernel source (full history to allow restoring Patchs from another branch)
+      # 1) 检出当前工作流仓库（如工作流不在目标仓库，此步仍需要）
+      - name: Checkout workflow repo
         uses: actions/checkout@v4
         with:
-          submodules: recursive
-          fetch-depth: 0  # 需要从 android15-lineage22-mod 恢复 Patchs
+          fetch-depth: 0
 
-      - name: Ensure Patchs directory exists (restore from android15-lineage22-mod if missing)
+      # 2) 先拉取目标仓库源码到指定目录 kernel-src
+      - name: Checkout target kernel repo (Anr-C/kernel_xiaomi_sm8250_mod) to kernel-src
+        uses: actions/checkout@v4
+        with:
+          repository: Anr-C/kernel_xiaomi_sm8250_mod
+          # 如传入 kernel_branch 则检出该分支；否则默认分支
+          ref: ${{ github.event.inputs.kernel_branch }}
+          path: kernel-src
+          submodules: recursive
+          fetch-depth: 0  # 便于从其他分支恢复 Patchs
+
+      # 3) 确保 Patchs 目录存在；如缺失从 android15-lineage22-mod 分支恢复
+      - name: Ensure Patchs exists (restore from android15-lineage22-mod if missing)
         shell: bash
+        working-directory: kernel-src
         run: |
           set -e
           if [[ -d "Patchs" ]]; then
             echo "Patchs/ already exists in current branch."
           else
             echo "Patchs/ not found. Restoring from branch: android15-lineage22-mod ..."
-            # 获取该分支并仅恢复 Patchs 目录到当前工作树（不切换 HEAD）
             git fetch origin android15-lineage22-mod --depth=1
             git restore --source=origin/android15-lineage22-mod -- Patchs
             if [[ ! -d "Patchs" ]]; then
@@ -53,11 +69,12 @@ jobs:
               exit 1
             fi
           fi
-          # 校验 LXC/其他补丁 zip 是否存在（脚本将依赖这些文件）
           ls -l Patchs || true
 
+      # 4) 基本检查：defconfig 是否存在
       - name: Preflight checks (defconfig existence)
         shell: bash
+        working-directory: kernel-src
         run: |
           set -e
           dev="${{ github.event.inputs.device }}"
@@ -67,6 +84,7 @@ jobs:
             exit 1
           fi
 
+      # 5) 安装构建依赖
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -79,13 +97,15 @@ jobs:
           # 为 ccache 建立 PATH 前缀（Ubuntu 推荐用法）
           echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
 
-      - name: Enable ccache cache (optional boost, does not change script behavior)
+      # 6) 启用 ccache（可选增强，不改变脚本行为）
+      - name: Enable ccache cache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: ${{ github.job }}-${{ github.event.inputs.device }}-${{ github.event.inputs.rom_type }}
+          key: ${{ github.job }}-${{ github.event.inputs.device }}-${{ github.event.inputs.rom_type }}-${{ github.event.inputs.kernel_branch }}
           max-size: 2G
           create-symlink: true
 
+      # 7) 拉取 Proton Clang 20210522（脚本期望路径）
       - name: Fetch Proton Clang 20210522 (expected by build.sh)
         run: |
           mkdir -p $HOME/proton-clang
@@ -93,6 +113,7 @@ jobs:
             $HOME/proton-clang/proton-clang-20210522
           echo "PATH=${TOOLCHAIN_PATH}:$PATH" >> $GITHUB_ENV
 
+      # 8) 显示工具链/链接器版本
       - name: Show toolchain & binutils versions
         run: |
           which clang || true
@@ -100,11 +121,13 @@ jobs:
           aarch64-linux-gnu-ld --version || true
           arm-linux-gnueabi-ld --version || true
 
-      - name: Run original build.sh with proper arguments (retain ALL features)
+      # 9) 运行原始脚本（参数与原逻辑保持一致，保留全部功能）
+      - name: Run original build.sh (retain ALL features)
         shell: bash
+        working-directory: kernel-src
         run: |
           set -e
-          device="${{ github.event.inputs.device }}"
+          dev="${{ github.event.inputs.device }}"
           rom="${{ github.event.inputs.rom_type }}"
           # 原脚本对 AOSP 的判断：第二或第三参数等于 aosp 则 BUILD_AOSP=1
           if [[ "$rom" == "aosp" ]]; then
@@ -119,17 +142,19 @@ jobs:
             ksu_arg=""
           fi
 
-          echo ">>> Invoking: bash build.sh ${device} ${aosp_arg} ${ksu_arg}"
-          bash build.sh "${device}" "${aosp_arg}" "${ksu_arg}"
+          chmod +x build.sh
+          echo ">>> Invoking: bash build.sh ${dev} ${aosp_arg} ${ksu_arg}"
+          bash build.sh "${dev}" "${aosp_arg}" "${ksu_arg}"
 
+      # 10) 上传产物（ZIP、Image、dtb）
       - name: Upload artifacts (zip, Image, dtb)
         uses: actions/upload-artifact@v4
         with:
           name: kernel-${{ github.event.inputs.device }}-${{ github.event.inputs.rom_type }}-${{ github.run_id }}
           path: |
-            ./*.zip
-            anykernel/kernels/Image
-            anykernel/kernels/dtb
-            out/arch/arm64/boot/Image
-            out/arch/arm64/boot/dts/**/*.dtb
+            kernel-src/*.zip
+            kernel-src/anykernel/kernels/Image
+            kernel-src/anykernel/kernels/dtb
+            kernel-src/out/arch/arm64/boot/Image
+            kernel-src/out/arch/arm64/boot/dts/**/*.dtb
           if-no-files-found: warn
