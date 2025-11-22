@@ -1,5 +1,5 @@
 
-name: Build kernel (picasso/AOSP) – version-aware toolchain (no KernelSU)
+name: Build kernel (picasso/AOSP) – universal LLVM toolchain + auto-fallback (no KernelSU)
 
 on:
   workflow_dispatch:
@@ -53,43 +53,34 @@ jobs:
           git reset --hard HEAD
           git clean -fd
 
-      # 3) 预检 defconfig
-      - name: Preflight checks (vendor/picasso_defconfig)
-        working-directory: kernel-src
+      # 3) 安装依赖（包含 GNU binutils；不安装 ccache）
+      - name: Install build dependencies
         shell: bash
         run: |
           set -e
-          if [[ ! -f "arch/arm64/configs/vendor/picasso_defconfig" ]]; then
-            echo "::error::未找到 defconfig: arch/arm64/configs/vendor/picasso_defconfig"
-            ls arch/arm64/configs/vendor/*_defconfig || true
-            exit 1
-          fi
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex libssl-dev \
+            zip unzip git patch curl \
+            build-essential make \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
 
-      # 4) （可选）应用 LXC 补丁 —— 保持你现有逻辑
-      - name: Apply LXC patches from remote
-        working-directory: kernel-src
+      # 4) 拉取 AOSP Clang 预编译（统一版本）
+      - name: Fetch AOSP Clang prebuilts (clang-r547379)
         shell: bash
         run: |
           set -e
-          curl -fsSL "https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/Patchs/LXC_utils.zip" -o /tmp/LXC_utils.zip
-          [[ -s /tmp/LXC_utils.zip ]] || { echo "::error::LXC_utils.zip 下载失败"; exit 1; }
+          mkdir -p "${TOOLCHAIN_ROOT}"
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 "${TOOLCHAIN_ROOT}/repo"
+          TOOLCHAIN_PATH="${TOOLCHAIN_ROOT}/repo/clang-r547379/bin"
+          echo "TOOLCHAIN_PATH=${TOOLCHAIN_PATH}" >> "$GITHUB_ENV"
+          echo "PATH=$PATH:${TOOLCHAIN_PATH}"     >> "$GITHUB_ENV"
 
-          rm -rf utils && unzip -o /tmp/LXC_utils.zip -d utils
-          if ! grep -q 'source "utils/Kconfig"' Kconfig; then
-            echo 'source "utils/Kconfig"' >> Kconfig
-          fi
-          DEFCONFIG="arch/arm64/configs/vendor/picasso_defconfig"
-          if ! grep -q '^CONFIG_DOCKER=y' "${DEFCONFIG}"; then
-            echo "CONFIG_DOCKER=y" >> "${DEFCONFIG}"
-          fi
-          sed -i '/CONFIG_ANDROID_PARANOID_NETWORK/d' "${DEFCONFIG}"
-          echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> "${DEFCONFIG}"
-          chmod +x utils/runcpatch.sh
-          [[ -f kernel/cgroup/cgroup.c ]] && sh utils/runcpatch.sh kernel/cgroup/cgroup.c
-          [[ -f kernel/cgroup.c       ]] && sh utils/runcpatch.sh kernel/cgroup.c
-          if [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]]; then
-            patch -p0 < utils/xt_qtaguid.patch || true
-          fi
+      - name: Show selected toolchain versions
+        shell: bash
+        run: |
+          which clang || true; clang --version || true
+          which ld.lld || true; ld.lld --version || true
 
       # 5) AnyKernel3
       - name: Prepare AnyKernel3
@@ -100,7 +91,7 @@ jobs:
           rm -rf out/ anykernel/
           git clone --depth=1 https://github.com/liyafe1997/AnyKernel3 -b kona anykernel
 
-      # 6) 给 defconfig 打版本戳（仅字符串，不影响配置）
+      # 6) 给 defconfig 打版本戳（仅字符串）
       - name: Stamp local version in defconfig
         working-directory: kernel-src
         shell: bash
@@ -124,76 +115,18 @@ jobs:
             sed -i '/^CONFIG_KSU/d'       arch/arm64/configs/vendor/picasso_defconfig || true
           fi
 
-      # 8) 解析 Makefile 得到内核版本（KERNELVERSION）
-      - name: Detect kernel version from Makefile (KERNELVERSION)
-        id: detectver
-        working-directory: kernel-src
-        shell: bash
-        run: |
-          set -e
-          MAJOR=$(awk '/^VERSION[[:space:]]*=/ {print $3}' Makefile)
-          MINOR=$(awk '/^PATCHLEVEL[[:space:]]*=/ {print $3}' Makefile)
-          SUBLV=$(awk '/^SUBLEVEL[[:space:]]*=/ {print $3}' Makefile)
-          EXTRA=$(awk '/^EXTRAVERSION[[:space:]]*=/ {print $3}' Makefile)
-          KV="${MAJOR}.${MINOR}.${SUBLV}${EXTRA}"
-          echo "kernel_version=${KV}" >> "$GITHUB_OUTPUT"
-          echo "Detected kernel version: ${KV}"
 
-      # 9) 根据版本选择 AOSP Clang 预编译版本
-      - name: Select AOSP Clang by kernel version
-        id: selectclang
-        shell: bash
-        run: |
-          set -e
-          KV="${{ steps.detectver.outputs.kernel_version }}"
-          MAJOR="${KV%%.*}"
-          REST="${KV#*.}"
-          MINOR="${REST%%.*}"
-
-          # 默认映射（可根据你的树微调）
-          if [[ "$MAJOR" -ge 6 ]]; then
-            CLANG_DIR="clang-r522817"   # Android 15 / 6.1
-          elif [[ "$MAJOR" -eq 5 && "$MINOR" -ge 15 ]]; then
-            CLANG_DIR="clang-r487747c"  # Android 14
-          elif [[ "$MAJOR" -eq 5 && "$MINOR" -eq 10 ]]; then
-            CLANG_DIR="clang-r416183b1" # Android 12
-          elif [[ "$MAJOR" -eq 4 && "$MINOR" -ge 19 ]]; then
-            CLANG_DIR="clang-r399163b"  # Android 11
-          else
-            CLANG_DIR="clang-r353983c"  # Android Q (老树)
-          fi
-
-          echo "clang_dir=${CLANG_DIR}" >> "$GITHUB_OUTPUT"
-          echo "Selected AOSP Clang: ${CLANG_DIR}"
-          # 说明：这些目录命名来自 AOSP Clang/LLVM 预编译仓库。参考官方 Readme。见注释与链接。
-
-      # 10) 拉取 AOSP Clang 预编译仓库（无缓存）
-      - name: Fetch AOSP Clang prebuilts
-        shell: bash
-        run: |
-          set -e
-          mkdir -p "${TOOLCHAIN_ROOT}"
-          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 "${TOOLCHAIN_ROOT}/repo"
-          TOOLCHAIN_PATH="${TOOLCHAIN_ROOT}/repo/${{ steps.selectclang.outputs.clang_dir }}/bin"
-          echo "TOOLCHAIN_PATH=${TOOLCHAIN_PATH}" >> "$GITHUB_ENV"
-          echo "PATH=$PATH:${TOOLCHAIN_PATH}"     >> "$GITHUB_ENV"
-
-      # 11) 显示工具版本（Clang/ld.lld）
-      - name: Show selected toolchain versions
-        shell: bash
-        run: |
-          which clang || true; clang --version || true
-          which ld.lld || true; ld.lld --version || true
-
-      # 13) 生成 defconfig（使用 LLVM=1 官方路径）
+      # 9) 生成 defconfig（使用 LLVM=1；Host 使用系统 gcc/g++）
       - name: make vendor/picasso_defconfig (LLVM=1)
         working-directory: kernel-src
         shell: bash
         run: |
           set -e
-          make LLVM=1 O=out ARCH=arm64 SUBARCH=arm64 vendor/picasso_defconfig
+          make LLVM=1 O=out ARCH=arm64 SUBARCH=arm64 \
+               HOSTCC=gcc HOSTCXX=g++ \
+               vendor/picasso_defconfig
 
-      # 14) 精简调试选项（提速） + olddefconfig（不再用 yes 管道）
+      # 10) 精简调试选项（提速） + olddefconfig（不再用 yes 管道）
       - name: Speed-focused config tuning
         working-directory: kernel-src
         shell: bash
@@ -205,7 +138,7 @@ jobs:
             -d DEBUG_KERNEL
           make LLVM=1 O=out ARCH=arm64 SUBARCH=arm64 olddefconfig
 
-      # 15) 容器内核项校验（moby）
+      # 11) 容器内核项校验（moby）
       - name: Verify Docker/LXC requirements via moby check-config.sh
         working-directory: kernel-src
         shell: bash
@@ -215,27 +148,49 @@ jobs:
           chmod +x /tmp/check-config.sh
           /tmp/check-config.sh out/.config
 
-      # 16) 编译（LLVM=1；记录完整日志）
-      - name: Build kernel (capture logs)
+      # 12) 编译：先 LLVM_IAS=1；失败则自动降级 LLVM_IAS=0 + GNU binutils
+      - name: Build kernel (universal toolchain with auto-fallback)
         working-directory: kernel-src
         shell: bash
         run: |
-          set -e
-          make LLVM=1 O=out ARCH=arm64 SUBARCH=arm64 -j"$(nproc)" 2>&1 | tee out/build.log
-          [[ -f out/arch/arm64/boot/Image ]] || { echo "::error::未生成 out/arch/arm64/boot/Image（详见 out/build.log）"; exit 1; }
-          echo "✅ Build OK: out/arch/arm64/boot/Image"
+          set -euo pipefail
+
+          echo ">>> Attempt 1: LLVM=1 (integrated assembler ON)"
+          if make LLVM=1 O=out ARCH=arm64 SUBARCH=arm64 -j"$(nproc)" 2>&1 | tee out/build_attempt1.log; then
+            echo "✅ Build OK on attempt 1"
+          else
+            echo "⚠️ Attempt 1 failed. Retrying with LLVM_IAS=0 + GNU binutils ..."
+            # 清理最小化（避免残留）
+            make O=out ARCH=arm64 SUBARCH=arm64 clean
+
+            # 注意：当 LLVM_IAS=0 时，需要提供 CROSS_COMPILE 前缀找到非集成汇编器/objcopy 等（官方建议）：
+            # https://docs.kernel.org/kbuild/llvm.html
+            if make LLVM=1 LLVM_IAS=0 \
+                    O=out ARCH=arm64 SUBARCH=arm64 \
+                    CROSS_COMPILE=aarch64-linux-gnu- \
+                    CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+                    -j"$(nproc)" 2>&1 | tee out/build_attempt2.log; then
+              echo "✅ Build OK on attempt 2 (LLVM_IAS=0 + GNU binutils)"
+            else
+              echo "::error::Build failed on both attempts. See logs in out/."
+              exit 1
+            fi
+          fi
+
+          [[ -f out/arch/arm64/boot/Image ]] || { echo "::error::未生成 out/arch/arm64/boot/Image"; exit 1; }
 
       - name: Upload build logs & config (always)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-picasso-aosp-${{ github.run_id }}
+          name: build-logs-universal-${{ github.run_id }}
           path: |
-            kernel-src/out/build.log
+            kernel-src/out/build_attempt1.log
+            kernel-src/out/build_attempt2.log
             kernel-src/out/.config
           if-no-files-found: warn
 
-      # 17) 生成 dtb
+      # 13) 生成 dtb
       - name: Generate dtb
         working-directory: kernel-src
         shell: bash
@@ -243,7 +198,7 @@ jobs:
           set -e
           find out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > out/arch/arm64/boot/dtb
 
-      # 18) 打包 AnyKernel3 刷写包
+      # 14) 打包 AnyKernel3 刷写包
       - name: Pack AnyKernel3 zip
         working-directory: kernel-src
         shell: bash
@@ -253,7 +208,7 @@ jobs:
           cp out/arch/arm64/boot/Image anykernel/kernels/
           cp out/arch/arm64/boot/dtb    anykernel/kernels/
           GIT_COMMIT_ID="$(git rev-parse --short=8 HEAD)"
-          ZIP_FILENAME="Kernel_AOSP_${TARGET_DEVICE}_NoKernelSU_$(date +%Y%m%d_%H%M%S)_anykernel3_${GIT_COMMIT_ID}.zip"
+          ZIP_FILENAME="Kernel_AOSP_${TARGET_DEVICE}_UniversalLLVM_$(date +%Y%m%d_%H%M%S)_anykernel3_${GIT_COMMIT_ID}.zip"
           (cd anykernel && zip -r9 "${ZIP_FILENAME}" ./* -x .git .gitignore out/ ./*.zip)
           mv anykernel/"${ZIP_FILENAME}" .
           echo "ZIP_FILENAME=${ZIP_FILENAME}" >> "$GITHUB_ENV"
@@ -264,25 +219,25 @@ jobs:
         run: |
           git restore --source=HEAD -- arch/arm64/configs/vendor/picasso_defconfig || true
 
-      # 19) 上传制品
+      # 15) 上传制品
       - name: Upload artifacts (zip, Image, dtb)
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-picasso-aosp-${{ github.run_id }}
+          name: kernel-universal-${{ github.run_id }}
           path: |
             kernel-src/${{ env.ZIP_FILENAME }}
             kernel-src/out/arch/arm64/boot/Image
             kernel-src/out/arch/arm64/boot/dts/**/*.dtb
           if-no-files-found: warn
 
-      # 20) 发布到 Release
+      # 16) 打 tag + 发布到 Release（与之前一致）
       - name: Create & push tag
         shell: bash
         run: |
           set -e
           git config user.name  "github-actions"
           git config user.email "github-actions@github.com"
-          TAG="picasso-aosp-${{ github.run_id }}-${{ github.run_number }}"
+          TAG="picasso-aosp-universal-${{ github.run_id }}-${{ github.run_number }}"
           git tag  "${TAG}"
           git push origin "${TAG}"
 
