@@ -63,9 +63,7 @@ jobs:
       - name: Checkout current repo
         uses: actions/checkout@v5
 
-      #####################################################################
-      # 在所有主要命令开始前：创建 10G 工作空间（loopback ext4），并供 O= 使用
-      #####################################################################
+      # 10G 工作空间（最前创建）
       - name: Prepare 10G build workspace (loopback ext4)
         id: ws
         shell: bash
@@ -100,12 +98,14 @@ jobs:
         run: |
           set -eux
           sudo apt-get update
+          # 关键：安装 aarch64 交叉 binutils，若禁用 IAS 时可用 aarch64 外部 as/ld
           sudo apt-get install -y \
             bc bison flex \
             build-essential git curl wget zip unzip patch \
             libssl-dev libelf-dev \
             python3 rsync ccache \
-            dwarves lz4 llvm
+            dwarves lz4 llvm \
+            binutils-aarch64-linux-gnu
 
       - name: Install specific LLVM/Clang via apt.llvm.org
         shell: bash
@@ -117,7 +117,7 @@ jobs:
           clang-${{ inputs.llvm_version }} --version || true
           ld.lld-${{ inputs.llvm_version }} --version || true
 
-      # 映射无后缀 LLVM 工具（满足 ld.lld 等无后缀调用）
+      # 映射无后缀 LLVM 工具（满足 ld.lld/clang 无后缀调用）
       - name: Map unsuffixed LLVM tool names to selected version
         shell: bash
         run: |
@@ -168,7 +168,6 @@ jobs:
         run: |
           set -eux
           DF_IN="${{ inputs.defconfig_path }}"
-
           if [ -f "$DF_IN" ]; then
             DF_PATH="$DF_IN"
           else
@@ -181,9 +180,7 @@ jobs:
             )
             DF_PATH=""
             for p in "${CANDIDATES[@]}"; do
-              if [ -f "$p" ]; then
-                DF_PATH="$p"; break
-              fi
+              if [ -f "$p" ]; then DF_PATH="$p"; break; fi
             done
             if [ -z "$DF_PATH" ]; then
               echo "❌ 未找到 defconfig 文件，尝试过以下位置："
@@ -191,19 +188,13 @@ jobs:
               exit 1
             fi
           fi
-
           CONFIGS_DIR="arch/${ARCH_IN}/configs/"
           case "$DF_PATH" in
-            ${CONFIGS_DIR}*)
-              DF_TARGET="${DF_PATH#${CONFIGS_DIR}}"
-              ;;
-            *)
-              DF_TARGET="$(basename "$DF_PATH")"
-              ;;
+            ${CONFIGS_DIR}*) DF_TARGET="${DF_PATH#${CONFIGS_DIR}}";;
+            *)               DF_TARGET="$(basename "$DF_PATH")";;
           esac
-
-          echo "DF_PATH=${DF_PATH}"       >> "$GITHUB_OUTPUT"
-          echo "DF_TARGET=${DF_TARGET}"   >> "$GITHUB_OUTPUT"
+          echo "DF_PATH=${DF_PATH}"     >> "$GITHUB_OUTPUT"
+          echo "DF_TARGET=${DF_TARGET}" >> "$GITHUB_OUTPUT"
           echo "✔ 解析到 defconfig：$DF_PATH"
           echo "✔ make 目标：${DF_TARGET}"
 
@@ -253,7 +244,7 @@ jobs:
           echo "✅ LXC 补丁安装完成！"
 
       # ===========================
-      # 目标构建（arm64，明确指定 triple；隔离 Host 参数）
+      # 目标构建（arm64）：启用 LLVM 集成汇编，避免宿主 /usr/bin/as
       # ===========================
       - name: Build kernel (LLVM=${{ inputs.llvm_version }})
         working-directory: kernel-src
@@ -262,13 +253,13 @@ jobs:
           set -eux
           export ARCH="${{ inputs.arch }}"
           export SUBARCH="${{ inputs.arch }}"
-          # 指定 arm64 目标三元组 & 隔离 Host CFLAGS/LDFLAGS
-          make O="${{ steps.ws.outputs.O_OUT }}" ARCH="${ARCH}" LLVM=-${{ inputs.llvm_version }} \
+          make O="${{ steps.ws.outputs.O_OUT }}" ARCH="${ARCH}" \
+               LLVM=-${{ inputs.llvm_version }} LLVM_IAS=1 \
                CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
                HOSTCFLAGS="" HOSTLDFLAGS="" KCFLAGS="" \
                "${{ steps.defcfg.outputs.DF_TARGET }}"
-
-          make -j"$(nproc)" O="${{ steps.ws.outputs.O_OUT }}" ARCH="${ARCH}" LLVM=-${{ inputs.llvm_version }} \
+          make -j"$(nproc)" O="${{ steps.ws.outputs.O_OUT }}" ARCH="${ARCH}" \
+               LLVM=-${{ inputs.llvm_version }} LLVM_IAS=1 \
                CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
                HOSTCFLAGS="" HOSTLDFLAGS="" KCFLAGS=""
 
@@ -278,7 +269,8 @@ jobs:
         run: |
           set -eux
           export ARCH="${{ inputs.arch }}"
-          make -j"$(nproc)" O="${{ steps.ws.outputs.O_OUT }}" ARCH="${ARCH}" LLVM=-${{ inputs.llvm_version }} \
+          make -j"$(nproc)" O="${{ steps.ws.outputs.O_OUT }}" ARCH="${ARCH}" \
+               LLVM=-${{ inputs.llvm_version }} LLVM_IAS=1 \
                CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
                HOSTCFLAGS="" HOSTLDFLAGS="" KCFLAGS="" modules || true
 
@@ -366,6 +358,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # 清理：卸载工作空间，删除镜像文件
       - name: Cleanup build workspace
         if: always()
         shell: bash
