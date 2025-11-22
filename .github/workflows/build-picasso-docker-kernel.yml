@@ -146,24 +146,7 @@ jobs:
           set -eux
           git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo_url }}" kernel-src
 
-      # 新增：初始化子模块（解决 drivers/kernelsu/Kconfig 缺失）
-      - name: Init submodules (if any)
-        working-directory: kernel-src
-        shell: bash
-        run: |
-          set -eux
-          git submodule update --init --recursive || true
 
-          # 若仍缺少 drivers/kernelsu/Kconfig，则创建最小占位 Kconfig，避免 Kconfig 解析失败
-          if [ ! -f drivers/kernelsu/Kconfig ]; then
-            echo "⚠️ drivers/kernelsu/Kconfig 仍不存在，创建最小占位 Kconfig 以继续构建。"
-            mkdir -p drivers/kernelsu
-            cat > drivers/kernelsu/Kconfig <<'EOF'
-menu "KernelSU (stub)"
-# 占位以避免 Kconfig 失败；实际功能未启用
-endmenu
-EOF
-          fi
 
       - name: Resolve defconfig path
         id: defcfg
