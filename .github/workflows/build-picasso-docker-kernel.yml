@@ -4,21 +4,25 @@ name: Build Android Kernel (LLVM) + LXC Patches + AnyKernel3 + Release
 on:
   workflow_dispatch:
     inputs:
-      kernel_repo_url: https://github.com/august-aosp/android_kernel_xiaomi_sm7250
-        description: "内核源码仓库地址（例如 https://github.com/<org>/<repo>.git）"
+      kernel_repo_url:
+        description: "内核源码仓库地址"
         required: true
+        default: "https://github.com/august-aosp/android_kernel_xiaomi_sm7250"
         type: string
-      kernel_branch: stable
+      kernel_branch:
         description: "内核源码分支或标签（默认 main）"
         required: true
+        default: "stable"
         type: string
-      device_codename: picasso
+      device_codename:
         description: "机型代号（例如 'beryllium'、'xaga' 等）"
         required: true
+        default: "picasso"
         type: string
-      defconfig_path: vendor/picasso_defconfig
+      defconfig_path:
         description: "defconfig 路径或文件名（如 'arch/arm64/configs/<codename>_defconfig' 或 '<codename>_defconfig'）"
         required: true
+        default: "vendor/picasso_defconfig"
         type: string
       arch:
         description: "编译架构（默认 arm64）"
@@ -45,6 +49,7 @@ on:
         required: false
         default: ""
         type: string
+
 
 permissions:
   contents: write
