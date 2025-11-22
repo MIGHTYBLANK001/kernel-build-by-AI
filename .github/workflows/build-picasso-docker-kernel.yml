@@ -185,17 +185,6 @@ jobs:
           which clang || true; clang --version || true
           which ld.lld || true; ld.lld --version || true
 
-      # 12) 不再改写 fair.c；若有改动，先还原
-      - name: Guard: restore kernel/sched/fair.c if modified
-        working-directory: kernel-src
-        shell: bash
-        run: |
-          set -e
-          if ! git restore --staged --worktree --quiet -- kernel/sched/fair.c 2>/dev/null; then
-            # 尝试 Worktree 还原
-            git checkout -- kernel/sched/fair.c || true
-          fi
-
       # 13) 生成 defconfig（使用 LLVM=1 官方路径）
       - name: make vendor/picasso_defconfig (LLVM=1)
         working-directory: kernel-src
