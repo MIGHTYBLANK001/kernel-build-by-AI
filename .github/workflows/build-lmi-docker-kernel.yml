@@ -261,7 +261,7 @@ jobs:
       - name: Upload artifacts (zip, Image, dtb)
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-${{ replace(inputs.kernel_repo, '/', '-') }}-${{ inputs.kernel_branch || 'default' }}-lmi-aosp-${{ github.run_id }}
+          name: kernel-${{ github.event.repository.name }}-${{ inputs.kernel_branch || 'default' }}-lmi-aosp-${{ github.run_id }}
           path: |
             kernel-src/*.zip
             kernel-src/anykernel/kernels/Image
