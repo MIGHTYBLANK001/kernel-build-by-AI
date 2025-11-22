@@ -39,9 +39,10 @@ jobs:
           SAFE_REPO="august-aosp-android_kernel_xiaomi_sm7250"
           KBRANCH="${{ inputs.kernel_branch }}"
           [[ -z "${KBRANCH}" ]] && KBRANCH="default"
-          echo "safe_repo=${SAFE_REPO}" >> "$GITHUB_OUTPUT"
+          echo "safe_repo=${SAFE_REPO}"  >> "$GITHUB_OUTPUT"
           echo "safe_branch=${KBRANCH}" >> "$GITHUB_OUTPUT"
 
+      # 缓存 Proton Clang 工具链（避免每次克隆）
       - name: Cache Proton Clang
         id: clangcache
         uses: actions/cache@v4
@@ -75,6 +76,7 @@ jobs:
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
           echo "PATH=/usr/lib/ccache:$PATH" >> "$GITHUB_ENV"
 
+      # ccache：提升命中率与压缩性能
       - name: Enable ccache cache (optimized)
         uses: hendrikmuhs/ccache-action@v1.2
         with:
@@ -96,6 +98,7 @@ jobs:
           echo "CCACHE_MAXSIZE=4G"                            >> "$GITHUB_ENV"
           echo "PATH=/usr/lib/ccache:$PATH"                   >> "$GITHUB_ENV"
 
+      # 检出目标内核源码
       - name: Checkout target kernel repo (specific branch) to kernel-src
         if: ${{ inputs.kernel_branch != '' }}
         uses: actions/checkout@v4
@@ -177,6 +180,7 @@ jobs:
         run: |
           make ${MAKE_ARGS} vendor/picasso_defconfig
 
+      # 关闭昂贵的调试项（减少编译时间/体积）
       - name: Speed-focused config tuning
         working-directory: kernel-src
         run: |
@@ -187,6 +191,7 @@ jobs:
             -d DEBUG_KERNEL
           yes "" | make ${MAKE_ARGS} olddefconfig
 
+      # Docker/LXC 必要项校验（moby 官方脚本）
       - name: Verify Docker/LXC requirements via moby check-config.sh
         working-directory: kernel-src
         run: |
@@ -195,16 +200,20 @@ jobs:
           chmod +x /tmp/check-config.sh
           /tmp/check-config.sh out/.config
 
+      # ===== B 方案：注入 task_struct state/__state 兼容宏，并替换调用 =====
       - name: Inject task_struct state compatibility macro & adapt calls
         working-directory: kernel-src
         run: |
           set -e
           cd kernel/sched
+
+          # 写入兼容宏头文件
           cat > task_state_compat.h <<'EOF'
 #ifndef __TASK_STATE_COMPAT_H__
 #define __TASK_STATE_COMPAT_H__
 
 #include <linux/version.h>
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0)
 # define READ_TASK_STATE(tsk)  READ_ONCE((tsk)->__state)
 #else
@@ -213,11 +222,16 @@ jobs:
 
 #endif /* __TASK_STATE_COMPAT_H__ */
 EOF
+
+          # 若 fair.c 未包含该头，则注入一行 include
           if ! grep -q 'task_state_compat.h' fair.c; then
             sed -i '1i #include "task_state_compat.h"' fair.c
           fi
-          sed -E -i 's/READ_ONCE\(\s*([[:alnum:]_\.]+)->__state\s*\)/READ_TASK_STATE(\1)/g' fair.c
 
+          # 将 READ_ONCE(p->__state) 统一替换为 READ_TASK_STATE(p)
+          sed -E -i 's/READ_ONCE\(\s*([[:alnum:]_.]+)->__state\s*\)/READ_TASK_STATE(\1)/g' fair.c
+
+      # 编译：默认 V=0，加速；仍保存完整日志
       - name: Build kernel (fast, capture logs)
         working-directory: kernel-src
         run: |
@@ -275,6 +289,7 @@ EOF
             kernel-src/out/arch/arm64/boot/dts/**/*.dtb
           if-no-files-found: warn
 
+      # 发布到 Release（创建 tag 并上传 AnyKernel ZIP）
       - name: Prepare release tag/name
         id: relmeta
         run: |
