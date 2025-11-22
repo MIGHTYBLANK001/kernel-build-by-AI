@@ -1,5 +1,5 @@
 
-name: Build kernel (lmi / AOSP) – expanded workflow (no build.sh, moby check-config)
+name: Build kernel (lmi/AOSP) – expanded workflow + release
 
 on:
   workflow_dispatch:
@@ -13,28 +13,29 @@ on:
         default: ""
         required: false
 
+permissions:
+  contents: write   # 允许创建/更新 Release 与推送 tag
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     env:
-      # 固定参数：机型与 ROM 类型
       TARGET_DEVICE: lmi
-      BUILD_AOSP: "1"     # 固定为 AOSP
-      KSU_ENABLE: "0"     # 此逻辑不包含 KernelSU/SukiSU
-      # 与原脚本保持一致的工具链和缓存路径
+      BUILD_AOSP: "1"
+      KSU_ENABLE: "0"
       TOOLCHAIN_PATH: ${{ github.workspace }}/../proton-clang/proton-clang-20210522/bin
-      CCACHE_DIR: ${{ github.workspace }}/../.cache/ccache_mikernel
+      # ✅ 修复：把 ccache 目录改为绝对路径，避免出现 '..'（actions/cache 不允许）
+      CCACHE_DIR: $HOME/.cache/ccache_mikernel
       MAKE_ARGS: "ARCH=arm64 SUBARCH=arm64 O=out CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
 
     steps:
-      # 0) 检出承载工作流的仓库（若工作流不在目标仓库，此步依然需要）
       - name: Checkout workflow repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 1) 先拉取目标仓库源码至 kernel-src —— 指定分支
+      # 检出目标内核源码（指定分支或默认分支）
       - name: Checkout target kernel repo (specific branch) to kernel-src
         if: ${{ inputs.kernel_branch != '' }}
         uses: actions/checkout@v4
@@ -45,7 +46,6 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      # 1b) 拉取目标仓库源码至 kernel-src —— 默认分支
       - name: Checkout target kernel repo (default branch) to kernel-src
         if: ${{ inputs.kernel_branch == '' }}
         uses: actions/checkout@v4
@@ -55,7 +55,6 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      # 2) 依赖安装
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -67,23 +66,22 @@ jobs:
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
           echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
 
-      # 3) 提升 ccache 命中（可选增强）
+      # ✅ 使用 ccache action；不再出现相对路径保存问题
       - name: Enable ccache cache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ github.job }}-${{ inputs.kernel_repo }}-${{ inputs.kernel_branch }}-lmi-aosp
           max-size: 2G
           create-symlink: true
+          # 其余参数按默认即可（使用 actions/cache v4）[5](https://github.com/hendrikmuhs/ccache-action/blob/main/action.yml)[2](https://github.com/actions/cache)
 
-      # 4) 拉取 Proton Clang 20210522（原脚本要求的路径与版本）
-      - name: Fetch Proton Clang 20210522 (expected by original logic)
+      - name: Fetch Proton Clang 20210522
         run: |
           mkdir -p $HOME/proton-clang
           git clone --depth=1 --branch 20210522 https://github.com/kdrag0n/proton-clang \
             $HOME/proton-clang/proton-clang-20210522
           echo "PATH=${TOOLCHAIN_PATH}:$PATH" >> $GITHUB_ENV
 
-      # 5) 显示工具链/链接器版本
       - name: Show toolchain & binutils versions
         run: |
           which clang || true
@@ -91,14 +89,12 @@ jobs:
           aarch64-linux-gnu-ld --version || true
           arm-linux-gnueabi-ld --version || true
 
-      # 6) 代码清理
       - name: Clean working tree
         working-directory: kernel-src
         run: |
           git reset --hard HEAD
           git clean -fd
 
-      # 7) 预检：defconfig 与 Patchs 是否存在
       - name: Preflight checks (defconfig & Patchs)
         working-directory: kernel-src
         run: |
@@ -113,7 +109,6 @@ jobs:
             exit 1
           fi
 
-      # 8) 安装 LXC 补丁（完全按原来的展开逻辑）
       - name: Apply LXC patches (enable Docker, qtaguid, runcpatch)
         working-directory: kernel-src
         run: |
@@ -123,35 +118,27 @@ jobs:
           if ! grep -q 'source "utils/Kconfig"' Kconfig; then
             echo 'source "utils/Kconfig"' >> Kconfig
           fi
-          # 打开自定义 Kconfig 项以启用 LXC/Docker 支持
+          # 开启 Docker 相关项（在 defconfig 中）
           if ! grep -q '^CONFIG_DOCKER=y' arch/arm64/configs/${TARGET_DEVICE}_defconfig; then
             echo "CONFIG_DOCKER=y" >> arch/arm64/configs/${TARGET_DEVICE}_defconfig
           fi
-          # 关闭 ANDROID_PARANOID_NETWORK
           sed -i '/CONFIG_ANDROID_PARANOID_NETWORK/d' arch/arm64/configs/${TARGET_DEVICE}_defconfig
           echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> arch/arm64/configs/${TARGET_DEVICE}_defconfig
 
           chmod +x utils/runcpatch.sh
-          if [[ -f kernel/cgroup/cgroup.c ]]; then
-            sh utils/runcpatch.sh kernel/cgroup/cgroup.c
-          fi
-          if [[ -f kernel/cgroup.c ]]; then
-            sh utils/runcpatch.sh kernel/cgroup.c
-          fi
+          [[ -f kernel/cgroup/cgroup.c ]] && sh utils/runcpatch.sh kernel/cgroup/cgroup.c
+          [[ -f kernel/cgroup.c ]] && sh utils/runcpatch.sh kernel/cgroup.c
           if [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]]; then
             patch -p0 < utils/xt_qtaguid.patch || true
           fi
           echo "✅ LXC 补丁安装完成！"
 
-      # 9) 初始化打包目录 & AnyKernel3（kona 分支）
       - name: Prepare AnyKernel3
         working-directory: kernel-src
         run: |
           rm -rf out/ anykernel/
-          echo "Clone AnyKernel3 (kona)..."
           git clone https://github.com/liyafe1997/AnyKernel3 -b kona --single-branch --depth=1 anykernel
 
-      # 10) 在 defconfig 中追加日期与 commit id（保留原脚本行为）
       - name: Stamp local version in defconfig
         working-directory: kernel-src
         run: |
@@ -161,13 +148,11 @@ jobs:
           local_version_date_str="-$(date +%Y%m%d)-${GIT_COMMIT_ID}-perf"
           sed -i "s/${local_version_str}/${local_version_date_str}/g" arch/arm64/configs/${TARGET_DEVICE}_defconfig
 
-      # 11) 生成 defconfig（到 out/.config）
       - name: make defconfig
         working-directory: kernel-src
         run: |
           make ${MAKE_ARGS} ${TARGET_DEVICE}_defconfig
 
-      # 12) 应用“基本优化配置”（scripts/config）
       - name: Apply optimized configurations via scripts/config
         working-directory: kernel-src
         run: |
@@ -206,38 +191,30 @@ jobs:
             -d ANDROID_PARANOID_NETWORK \
             -e PSTORE_LAST_KMSG
 
-      # 12.5) 使用 Moby 的 check-config.sh 对 out/.config 做完整 Docker/LXC 兼容性检查
+      # 使用 moby 的 check-config.sh 做 Docker/LXC 兼容性检查
       - name: Verify Docker/LXC requirements via moby check-config.sh
         working-directory: kernel-src
         run: |
           set -e
-          echo "🔍 Fetching moby check-config.sh ..."
           curl -fsSL https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh -o /tmp/check-config.sh
           chmod +x /tmp/check-config.sh
-          echo "🔍 Running check-config.sh against out/.config ..."
           /tmp/check-config.sh out/.config
+          # 这个脚本是 Docker/Moby 官方提供的内核配置校验工具。[6](https://github.com/XiaBei-cy/Thyme-Kernel-Builder)
 
-      # 13) 编译
       - name: Build kernel
         working-directory: kernel-src
         run: |
           set -e
           make ${MAKE_ARGS} -j$(nproc)
-          if [[ ! -f "out/arch/arm64/boot/Image" ]]; then
-            echo "::error::编译失败，未生成 out/arch/arm64/boot/Image"
-            exit 1
-          fi
+          [[ -f out/arch/arm64/boot/Image ]] || { echo "::error::未生成 out/arch/arm64/boot/Image"; exit 1; }
           echo "✅ Build OK: out/arch/arm64/boot/Image"
 
-      # 14) 生成聚合 dtb
       - name: Generate dtb (concatenate *.dtb)
         working-directory: kernel-src
         run: |
           set -e
-          echo "Generating [out/arch/arm64/boot/dtb] ..."
           find out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > out/arch/arm64/boot/dtb
 
-      # 15) 拷贝到 AnyKernel3 并打包
       - name: Pack AnyKernel3 zip
         working-directory: kernel-src
         run: |
@@ -249,23 +226,57 @@ jobs:
           ZIP_FILENAME="Kernel_AOSP_${TARGET_DEVICE}_NoKernelSU_$(date +'%Y%m%d_%H%M%S')_anykernel3_${GIT_COMMIT_ID}.zip"
           (cd anykernel && zip -r9 "${ZIP_FILENAME}" ./* -x .git .gitignore out/ ./*.zip)
           mv anykernel/${ZIP_FILENAME} .
+          echo "ZIP_FILENAME=${ZIP_FILENAME}" >> $GITHUB_ENV
+          echo "KERNEL_COMMIT=${GIT_COMMIT_ID}" >> $GITHUB_ENV
           echo "Done. The flashable zip is: ./${ZIP_FILENAME}"
 
-      # 16) 恢复 defconfig 的 local version 字符串（保持与原脚本一致）
       - name: Restore defconfig local version string
         working-directory: kernel-src
         run: |
           git restore --source=HEAD -- arch/arm64/configs/${TARGET_DEVICE}_defconfig || true
 
-      # 17) 上传制品
+      # ✅ 修复：artifact 名称去掉斜杠（/）
       - name: Upload artifacts (zip, Image, dtb)
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-${{ github.event.repository.name }}-${{ inputs.kernel_branch || 'default' }}-lmi-aosp-${{ github.run_id }}
+          name: kernel-${{ replace(inputs.kernel_repo, '/', '-') }}-${{ inputs.kernel_branch || 'default' }}-lmi-aosp-${{ github.run_id }}
           path: |
-            kernel-src/*.zip
+            kernel-src/${{ env.ZIP_FILENAME }}
             kernel-src/anykernel/kernels/Image
             kernel-src/anykernel/kernels/dtb
             kernel-src/out/arch/arm64/boot/Image
             kernel-src/out/arch/arm64/boot/dts/**/*.dtb
           if-no-files-found: warn
+
+      # ====== 新增：发布到 Release（创建 tag 并上传 AnyKernel ZIP） ======
+
+      # 生成发布标签与名称
+      - name: Prepare release tag/name
+        id: relmeta
+        run: |
+          TAG="lmi-aosp-${{ github.run_id }}-${{ github.run_number }}"
+          NAME="Kernel AOSP lmi (${TAG}) [kernel commit: ${KERNEL_COMMIT}]"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "name=${NAME}" >> $GITHUB_OUTPUT
+
+      # 在工作流仓库创建并推送 tag（release 将发布在当前仓库）
+      - name: Create and push tag
+        run: |
+          set -e
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag "${{ steps.relmeta.outputs.tag }}"
+          git push origin "${{ steps.relmeta.outputs.tag }}"
+
+      # 使用 softprops/action-gh-release 创建发布并上传 ZIP 资产
+      - name: Create GitHub Release & upload AnyKernel ZIP
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.relmeta.outputs.tag }}
+          name: ${{ steps.relmeta.outputs.name }}
+          generate_release_notes: true
+          files: |
+            kernel-src/${{ env.ZIP_FILENAME }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # 这个 action 是当前社区常用的创建发布并上传资产的方式。[4](https://github.com/softprops/action-gh-release)
