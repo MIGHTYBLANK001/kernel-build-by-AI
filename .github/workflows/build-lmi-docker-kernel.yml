@@ -1,5 +1,5 @@
 
-name: Build kernel (lmi / AOSP) – expanded workflow (no build.sh)
+name: Build kernel (lmi / AOSP) – expanded workflow (no build.sh, moby check-config)
 
 on:
   workflow_dispatch:
@@ -12,11 +12,6 @@ on:
         description: "要构建的分支；留空则使用仓库默认分支"
         default: ""
         required: false
-
-  # 如需 push 自动触发，取消注释并设置分支名
-  # push:
-  #   branches:
-  #     - main
 
 jobs:
   build:
@@ -50,7 +45,7 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      # 1b) 先拉取目标仓库源码至 kernel-src —— 默认分支
+      # 1b) 拉取目标仓库源码至 kernel-src —— 默认分支
       - name: Checkout target kernel repo (default branch) to kernel-src
         if: ${{ inputs.kernel_branch == '' }}
         uses: actions/checkout@v4
@@ -60,7 +55,7 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      # 2) 依赖安装（与原脚本编译环境匹配）
+      # 2) 依赖安装
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -72,7 +67,7 @@ jobs:
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
           echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
 
-      # 3) 提升 ccache 命中（可选增强，不改变逻辑）
+      # 3) 提升 ccache 命中（可选增强）
       - name: Enable ccache cache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
@@ -96,7 +91,7 @@ jobs:
           aarch64-linux-gnu-ld --version || true
           arm-linux-gnueabi-ld --version || true
 
-      # 6) 代码清理（等价于原脚本 git reset/clean）
+      # 6) 代码清理
       - name: Clean working tree
         working-directory: kernel-src
         run: |
@@ -118,7 +113,7 @@ jobs:
             exit 1
           fi
 
-      # 8) 安装 LXC 补丁（完全按原脚本逻辑展开）
+      # 8) 安装 LXC 补丁（完全按原来的展开逻辑）
       - name: Apply LXC patches (enable Docker, qtaguid, runcpatch)
         working-directory: kernel-src
         run: |
@@ -128,7 +123,7 @@ jobs:
           if ! grep -q 'source "utils/Kconfig"' Kconfig; then
             echo 'source "utils/Kconfig"' >> Kconfig
           fi
-          # 打开 Docker
+          # 打开自定义 Kconfig 项以启用 LXC/Docker 支持
           if ! grep -q '^CONFIG_DOCKER=y' arch/arm64/configs/${TARGET_DEVICE}_defconfig; then
             echo "CONFIG_DOCKER=y" >> arch/arm64/configs/${TARGET_DEVICE}_defconfig
           fi
@@ -156,7 +151,7 @@ jobs:
           echo "Clone AnyKernel3 (kona)..."
           git clone https://github.com/liyafe1997/AnyKernel3 -b kona --single-branch --depth=1 anykernel
 
-      # 10) 本地版本号追加日期和 commit id（与原脚本一致）
+      # 10) 在 defconfig 中追加日期与 commit id（保留原脚本行为）
       - name: Stamp local version in defconfig
         working-directory: kernel-src
         run: |
@@ -166,13 +161,13 @@ jobs:
           local_version_date_str="-$(date +%Y%m%d)-${GIT_COMMIT_ID}-perf"
           sed -i "s/${local_version_str}/${local_version_date_str}/g" arch/arm64/configs/${TARGET_DEVICE}_defconfig
 
-      # 11) 生成 defconfig
+      # 11) 生成 defconfig（到 out/.config）
       - name: make defconfig
         working-directory: kernel-src
         run: |
           make ${MAKE_ARGS} ${TARGET_DEVICE}_defconfig
 
-      # 12) 应用“基本优化配置”（按原脚本的 scripts/config 批量设置）
+      # 12) 应用“基本优化配置”（scripts/config）
       - name: Apply optimized configurations via scripts/config
         working-directory: kernel-src
         run: |
@@ -211,9 +206,18 @@ jobs:
             -d ANDROID_PARANOID_NETWORK \
             -e PSTORE_LAST_KMSG
 
-      # 13) （AOSP 构建）跳过 MIUI 专属 DTS/配置修改
+      # 12.5) 使用 Moby 的 check-config.sh 对 out/.config 做完整 Docker/LXC 兼容性检查
+      - name: Verify Docker/LXC requirements via moby check-config.sh
+        working-directory: kernel-src
+        run: |
+          set -e
+          echo "🔍 Fetching moby check-config.sh ..."
+          curl -fsSL https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh -o /tmp/check-config.sh
+          chmod +x /tmp/check-config.sh
+          echo "🔍 Running check-config.sh against out/.config ..."
+          /tmp/check-config.sh out/.config
 
-      # 14) 编译
+      # 13) 编译
       - name: Build kernel
         working-directory: kernel-src
         run: |
@@ -225,7 +229,7 @@ jobs:
           fi
           echo "✅ Build OK: out/arch/arm64/boot/Image"
 
-      # 15) 生成聚合 dtb（与原脚本一致）
+      # 14) 生成聚合 dtb
       - name: Generate dtb (concatenate *.dtb)
         working-directory: kernel-src
         run: |
@@ -233,7 +237,7 @@ jobs:
           echo "Generating [out/arch/arm64/boot/dtb] ..."
           find out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > out/arch/arm64/boot/dtb
 
-      # 16) 拷贝到 AnyKernel3 并打包
+      # 15) 拷贝到 AnyKernel3 并打包
       - name: Pack AnyKernel3 zip
         working-directory: kernel-src
         run: |
@@ -247,13 +251,13 @@ jobs:
           mv anykernel/${ZIP_FILENAME} .
           echo "Done. The flashable zip is: ./${ZIP_FILENAME}"
 
-      # 17) 恢复 defconfig 的 local version 字符串（与原脚本一致）
+      # 16) 恢复 defconfig 的 local version 字符串（保持与原脚本一致）
       - name: Restore defconfig local version string
         working-directory: kernel-src
         run: |
           git restore --source=HEAD -- arch/arm64/configs/${TARGET_DEVICE}_defconfig || true
 
-      # 18) 上传制品
+      # 17) 上传制品
       - name: Upload artifacts (zip, Image, dtb)
         uses: actions/upload-artifact@v4
         with:
