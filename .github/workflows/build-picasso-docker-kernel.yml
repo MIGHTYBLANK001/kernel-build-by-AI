@@ -1,5 +1,5 @@
 
-name: Build kernel (picasso/AOSP) – fast workflow + release (fix host ld & explicit target toolchain)
+name: Build kernel (picasso/AOSP) – clean run (no caches) + release (no KernelSU)
 
 on:
   workflow_dispatch:
@@ -22,15 +22,15 @@ jobs:
       TOOLCHAIN_ROOT: ${{ github.workspace }}/../proton-clang
       TOOLCHAIN_VERSION: "20210522"
       TOOLCHAIN_PATH: ${{ github.workspace }}/../proton-clang/proton-clang-20210522/bin
-      CCACHE_DIR: $HOME/.cache/ccache_picasso
-      CCACHE_BASEDIR: ${{ github.workspace }}/kernel-src
 
     steps:
+      # 1) 检出工作流仓库
       - name: Checkout workflow repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
+      # 2) 安全命名（artifact 名称不含非法字符）
       - name: Prepare safe names
         id: names
         shell: bash
@@ -42,35 +42,26 @@ jobs:
           echo "safe_repo=${SAFE_REPO}"  >> "$GITHUB_OUTPUT"
           echo "safe_branch=${KBRANCH}" >> "$GITHUB_OUTPUT"
 
-      # 缓存 Proton Clang（避免每次克隆）
-      - name: Cache Proton Clang
-        id: clangcache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.TOOLCHAIN_ROOT }}
-          key: proton-clang-${{ env.TOOLCHAIN_VERSION }}
-          restore-keys: |
-            proton-clang-
-
-      - name: Fetch Proton Clang (if cache missed)
-        if: steps.clangcache.outputs.cache-hit != 'true'
+      # 3) 拉取 Proton Clang（每次新拉取；无缓存）
+      - name: Fetch Proton Clang (fresh each run; no cache)
         shell: bash
         run: |
           set -e
           mkdir -p "${TOOLCHAIN_ROOT}"
           git clone --depth=1 --branch "${TOOLCHAIN_VERSION}" https://github.com/kdrag0n/proton-clang \
             "${TOOLCHAIN_ROOT}/proton-clang-${TOOLCHAIN_VERSION}"
-          # Proton Clang 说明：LLVM/Clang 工具链，包含 binutils，且采用 LTO/PGO 优化编译时长。[5](https://github.com/liyafe1997/AnyKernel3)
 
-      # **关键修正**：不要前置 PATH；改为追加到末尾，并显式导出目标工具链变量
-      - name: Configure toolchains (keep system ld for host; explicit target tool paths)
+      # 4) 配置工具链
+      #    - 不前置 PATH（仅追加到末尾），避免旧 ld 覆盖系统 ld
+      #    - 目标内核显式使用 clang/ld.lld/llvm-*；主机侧用系统 gcc/g++
+      - name: Configure toolchains (system ld for host; explicit target tools)
         shell: bash
         run: |
           set -e
-          # 追加，不要覆盖系统 /usr/bin/ld
+          # 追加，不覆盖系统 /usr/bin/ld
           echo "PATH=$PATH:${TOOLCHAIN_PATH}"    >> "$GITHUB_ENV"
 
-          # 目标内核使用的 Clang/LLD/LLVM 工具（显式设置，避免 PATH 影响）
+          # 目标内核使用的 Clang/LLD/LLVM 工具（显式设置，避免 PATH 混用）
           echo "CC=${TOOLCHAIN_PATH}/clang"       >> "$GITHUB_ENV"
           echo "LD=${TOOLCHAIN_PATH}/ld.lld"      >> "$GITHUB_ENV"
           echo "AR=${TOOLCHAIN_PATH}/llvm-ar"     >> "$GITHUB_ENV"
@@ -78,22 +69,20 @@ jobs:
           echo "OBJCOPY=${TOOLCHAIN_PATH}/llvm-objcopy" >> "$GITHUB_ENV"
           echo "STRIP=${TOOLCHAIN_PATH}/llvm-strip"     >> "$GITHUB_ENV"
 
-          # 主机侧始终用系统编译器/链接器构建 fixdep 等（避免旧 ld 不支持 .relr.dyn）
-          echo "HOSTCC=gcc"                       >> "$GITHUB_ENV"
-          echo "HOSTCXX=g++"                      >> "$GITHUB_ENV"
-          echo "HOSTLDFLAGS="                     >> "$GITHUB_ENV"   # 可按需追加主机链接标志
-          # 参考：Kbuild 对 HOSTCC/HOSTCFLAGS/HOSTLDFLAGS 的定义。[6](https://docs.kernel.org/kbuild/kbuild.html)
+          # 主机侧始终用系统编译器/链接器（避免旧 ld 不识别 .relr.dyn）
+          echo "HOSTCC=gcc"                        >> "$GITHUB_ENV"
+          echo "HOSTCXX=g++"                       >> "$GITHUB_ENV"
 
       - name: Show host & target toolchain versions
         shell: bash
         run: |
-          which cc      || true; cc      --version || true
-          which gcc     || true; gcc     --version || true
-          which ld      || true; ld      --version  || true
-          which clang   || true; clang   --version  || true
-          which ld.lld  || true; ld.lld  --version  || true
+          which gcc || true; gcc --version || true
+          which ld  || true; ld  --version || true
+          which clang  || true; clang  --version || true
+          which ld.lld || true; ld.lld --version || true
           echo "CC=${CC}"; echo "LD=${LD}"
 
+      # 5) 安装基础依赖（不安装 ccache）
       - name: Install build dependencies
         shell: bash
         run: |
@@ -103,34 +92,9 @@ jobs:
             bc bison flex libssl-dev \
             zip unzip git patch curl \
             build-essential make \
-            ccache \
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
-          echo "PATH=/usr/lib/ccache:$PATH" >> "$GITHUB_ENV"
 
-      # ccache：提升命中率与压缩性能
-      - name: Enable ccache cache (optimized)
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: ${{ github.job }}-${{ steps.names.outputs.safe_repo }}-${{ steps.names.outputs.safe_branch }}-picasso-aosp
-          restore-keys: |
-            ${{ github.job }}-${{ steps.names.outputs.safe_repo }}-
-            ${{ github.job }}-
-          max-size: 4G
-          create-symlink: true
-          job-summary: "CCache 统计"
-
-      - name: Configure ccache knobs
-        shell: bash
-        run: |
-          echo "CCACHE_DIR=${CCACHE_DIR}"                     >> "$GITHUB_ENV"
-          echo "CCACHE_BASEDIR=${CCACHE_BASEDIR}"             >> "$GITHUB_ENV"
-          echo "CCACHE_COMPRESS=true"                         >> "$GITHUB_ENV"
-          echo "CCACHE_COMPRESSLEVEL=5"                       >> "$GITHUB_ENV"
-          echo "CCACHE_SLOPPINESS=time_macros,file_stat"      >> "$GITHUB_ENV"
-          echo "CCACHE_MAXSIZE=4G"                            >> "$GITHUB_ENV"
-          echo "PATH=/usr/lib/ccache:$PATH"                   >> "$GITHUB_ENV"
-
-      # 检出目标内核源码
+      # 6) 检出目标内核源码
       - name: Checkout target kernel repo (specific branch) to kernel-src
         if: ${{ inputs.kernel_branch != '' }}
         uses: actions/checkout@v4
@@ -157,6 +121,7 @@ jobs:
           git reset --hard HEAD
           git clean -fd
 
+      # 7) 预检 defconfig
       - name: Preflight checks (vendor/picasso_defconfig)
         working-directory: kernel-src
         shell: bash
@@ -168,6 +133,7 @@ jobs:
             exit 1
           fi
 
+      # 8) 应用 LXC 补丁（远程下载）
       - name: Apply LXC patches from remote
         working-directory: kernel-src
         shell: bash
@@ -196,6 +162,7 @@ jobs:
             patch -p0 < utils/xt_qtaguid.patch || true
           fi
 
+      # 9) AnyKernel3
       - name: Prepare AnyKernel3
         working-directory: kernel-src
         shell: bash
@@ -204,6 +171,7 @@ jobs:
           rm -rf out/ anykernel/
           git clone --depth=1 https://github.com/liyafe1997/AnyKernel3 -b kona anykernel
 
+      # 10) defconfig 加版本戳
       - name: Stamp local version in defconfig (vendor/picasso_defconfig)
         working-directory: kernel-src
         shell: bash
@@ -212,8 +180,30 @@ jobs:
           GIT_COMMIT_ID="$(git rev-parse --short=8 HEAD)"
           sed -i "s/-perf/-$(date +%Y%m%d)-${GIT_COMMIT_ID}-perf/g" arch/arm64/configs/vendor/picasso_defconfig
 
-      # **注意**：此处 make 会构建 host 工具（fixdep），我们已强制 HOSTCC=gcc 并避免覆盖系统 ld
-      - name: make vendor/picasso_defconfig (host uses system ld)
+      # 11) **方式 A**：动态移除 KernelSU 引用（不包含 KernelSU）
+      - name: Drop KernelSU from Kconfig/defconfig (no kernelsu)
+        working-directory: kernel-src
+        shell: bash
+        run: |
+          set -e
+          # 删除 drivers/Kconfig 中的 source "drivers/kernelsu/Kconfig"（无论是否有前缀空格）
+          if [[ -f drivers/Kconfig ]]; then
+            sed -i 's|^[[:space:]]*source[[:space:]]*"drivers/kernelsu/Kconfig"[[:space:]]*$||' drivers/Kconfig || true
+          fi
+
+          # 从 defconfig 中移除任何可能的 KernelSU 相关配置项（不同树命名可能不同）
+          if [[ -f arch/arm64/configs/vendor/picasso_defconfig ]]; then
+            sed -i '/^CONFIG_KERNELSU/d' arch/arm64/configs/vendor/picasso_defconfig || true
+            sed -i '/^CONFIG_KERNEL_SU/d' arch/arm64/configs/vendor/picasso_defconfig || true
+            sed -i '/^CONFIG_KSU/d'       arch/arm64/configs/vendor/picasso_defconfig || true
+          fi
+
+          # 打印上下文（便于诊断）
+          echo ">>> drivers/Kconfig (context 200-260):"
+          nl -ba drivers/Kconfig | sed -n '200,260p' || true
+
+      # 12) 生成 defconfig（主机工具用系统 gcc/ld；目标用 clang/ld.lld）
+      - name: make vendor/picasso_defconfig
         working-directory: kernel-src
         shell: bash
         run: |
@@ -224,7 +214,7 @@ jobs:
                CLANG_TRIPLE=aarch64-linux-gnu- \
                vendor/picasso_defconfig
 
-      # 关闭昂贵的调试项（减少编译时间/体积）
+      # 13) 精简调试选项（提速）
       - name: Speed-focused config tuning
         working-directory: kernel-src
         shell: bash
@@ -236,7 +226,7 @@ jobs:
             -d DEBUG_KERNEL
           yes "" | make O=out ARCH=arm64 SUBARCH=arm64 olddefconfig
 
-      # Docker/LXC 必要项校验（moby 官方脚本）
+      # 14) 容器内核项校验（moby 官方脚本）
       - name: Verify Docker/LXC requirements via moby check-config.sh
         working-directory: kernel-src
         shell: bash
@@ -245,9 +235,8 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh -o /tmp/check-config.sh
           chmod +x /tmp/check-config.sh
           /tmp/check-config.sh out/.config
-        # Docker/Moby 官方脚本用于容器所需内核配置核验。[8](https://linuxvox.com/blog/kern-log-linux/)
 
-      # **兼容方案**：按头文件实际情况改写 fair.c 的 __state/state 引用，避免 YAML heredoc
+      # 15) 兼容：自动改写 __state → state（按头文件实际情况）
       - name: Adapt __state usages to current kernel (no heredoc)
         working-directory: kernel-src
         shell: bash
@@ -260,10 +249,9 @@ jobs:
           else
             echo "__state field present; no rewrite needed."
           fi
-        # 字段差异来自上游在 5.14 左右的迁移，按源码树自动适配更稳妥。[9](https://dev.to/arif_hossain/basic-github-actions-checkout-3588)
 
-      # 编译：保存完整日志
-      - name: Build kernel (fast, capture logs)
+      # 16) 编译（保存完整日志）
+      - name: Build kernel (capture logs)
         working-directory: kernel-src
         shell: bash
         run: |
@@ -288,6 +276,7 @@ jobs:
             kernel-src/.config
           if-no-files-found: warn
 
+      # 17) 生成 dtb
       - name: Generate dtb (concatenate *.dtb)
         working-directory: kernel-src
         shell: bash
@@ -295,6 +284,7 @@ jobs:
           set -e
           find out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > out/arch/arm64/boot/dtb
 
+      # 18) 打包 AnyKernel3 刷写包
       - name: Pack AnyKernel3 zip
         working-directory: kernel-src
         shell: bash
@@ -304,7 +294,7 @@ jobs:
           cp out/arch/arm64/boot/Image anykernel/kernels/
           cp out/arch/arm64/boot/dtb    anykernel/kernels/
           GIT_COMMIT_ID="$(git rev-parse --short=8 HEAD)"
-          ZIP_FILENAME="Kernel_AOSP_${TARGET_DEVICE}_NoKernelSU_$(date +%Y%m%d_%H%M%S')_anykernel3_${GIT_COMMIT_ID}.zip"
+          ZIP_FILENAME="Kernel_AOSP_${TARGET_DEVICE}_NoKernelSU_$(date +%Y%m%d_%H%M%S)_anykernel3_${GIT_COMMIT_ID}.zip"
           (cd anykernel && zip -r9 "${ZIP_FILENAME}" ./* -x .git .gitignore out/ ./*.zip)
           mv anykernel/"${ZIP_FILENAME}" .
           echo "ZIP_FILENAME=${ZIP_FILENAME}" >> "$GITHUB_ENV"
@@ -316,6 +306,7 @@ jobs:
         run: |
           git restore --source=HEAD -- arch/arm64/configs/vendor/picasso_defconfig || true
 
+      # 19) 上传制品
       - name: Upload artifacts (zip, Image, dtb)
         uses: actions/upload-artifact@v4
         with:
@@ -328,7 +319,7 @@ jobs:
             kernel-src/out/arch/arm64/boot/dts/**/*.dtb
           if-no-files-found: warn
 
-      # 发布到 Release（创建 tag 并上传 AnyKernel ZIP）
+      # 20) 发布到 Release
       - name: Prepare release tag/name
         id: relmeta
         shell: bash
