@@ -10,7 +10,7 @@ on:
         required: false
 
 permissions:
-  contents: write   # 允许创建/更新 Release 与推送 tag
+  contents: write
 
 jobs:
   build:
@@ -19,13 +19,11 @@ jobs:
     env:
       TARGET_DEVICE: picasso
       BUILD_AOSP: "1"
-      # 工具链与缓存
       TOOLCHAIN_ROOT: ${{ github.workspace }}/../proton-clang
       TOOLCHAIN_VERSION: "20210522"
       TOOLCHAIN_PATH: ${{ github.workspace }}/../proton-clang/proton-clang-20210522/bin
       CCACHE_DIR: $HOME/.cache/ccache_picasso
       CCACHE_BASEDIR: ${{ github.workspace }}/kernel-src
-      # kbuild 基本参数
       MAKE_ARGS: "ARCH=arm64 SUBARCH=arm64 O=out CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
 
     steps:
@@ -36,16 +34,14 @@ jobs:
 
       - name: Prepare safe names
         id: names
-        shell: bash
         run: |
           set -e
           SAFE_REPO="august-aosp-android_kernel_xiaomi_sm7250"
           KBRANCH="${{ inputs.kernel_branch }}"
           [[ -z "${KBRANCH}" ]] && KBRANCH="default"
-          echo "safe_repo=${SAFE_REPO}"   >> $GITHUB_OUTPUT
-          echo "safe_branch=${KBRANCH}"   >> $GITHUB_OUTPUT
+          echo "safe_repo=${SAFE_REPO}" >> "$GITHUB_OUTPUT"
+          echo "safe_branch=${KBRANCH}" >> "$GITHUB_OUTPUT"
 
-      # ===== 缓存 Proton Clang 工具链（避免每次克隆） =====
       - name: Cache Proton Clang
         id: clangcache
         uses: actions/cache@v4
@@ -58,17 +54,18 @@ jobs:
       - name: Fetch Proton Clang (if cache missed)
         if: steps.clangcache.outputs.cache-hit != 'true'
         run: |
+          set -e
           mkdir -p "${TOOLCHAIN_ROOT}"
-          git clone --depth=1 --branch ${TOOLCHAIN_VERSION} https://github.com/kdrag0n/proton-clang \
+          git clone --depth=1 --branch "${TOOLCHAIN_VERSION}" https://github.com/kdrag0n/proton-clang \
             "${TOOLCHAIN_ROOT}/proton-clang-${TOOLCHAIN_VERSION}"
-        # Proton Clang 的 LTO/PGO 构建可降低编译时间（官方 README 说明）。[2](https://github.com/liyafe1997/AnyKernel3)
 
       - name: Add toolchain to PATH
         run: |
-          echo "PATH=${TOOLCHAIN_PATH}:$PATH" >> $GITHUB_ENV
+          echo "PATH=${TOOLCHAIN_PATH}:$PATH" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         run: |
+          set -e
           sudo apt-get update
           sudo apt-get install -y \
             bc bison flex libssl-dev \
@@ -76,9 +73,8 @@ jobs:
             build-essential make \
             ccache \
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
-          echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
+          echo "PATH=/usr/lib/ccache:$PATH" >> "$GITHUB_ENV"
 
-      # ===== ccache：提升命中率与压缩性能 =====
       - name: Enable ccache cache (optimized)
         uses: hendrikmuhs/ccache-action@v1.2
         with:
@@ -91,18 +87,15 @@ jobs:
           job-summary: "CCache 统计"
 
       - name: Configure ccache knobs
-        shell: bash
         run: |
-          # 官方文档推荐的加速参数：压缩/基目录/“宽松模式”以减少路径差异影响缓存。[1](https://github.com/hendrikmuhs/ccache-action/blob/main/action.yml)
-          echo "CCACHE_DIR=${CCACHE_DIR}"           >> $GITHUB_ENV
-          echo "CCACHE_BASEDIR=${CCACHE_BASEDIR}"   >> $GITHUB_ENV
-          echo "CCACHE_COMPRESS=true"               >> $GITHUB_ENV
-          echo "CCACHE_COMPRESSLEVEL=5"             >> $GITHUB_ENV
-          echo "CCACHE_SLOPPINESS=time_macros,file_stat" >> $GITHUB_ENV
-          echo "CCACHE_MAXSIZE=4G"                  >> $GITHUB_ENV
-          echo "PATH=/usr/lib/ccache:$PATH"         >> $GITHUB_ENV
+          echo "CCACHE_DIR=${CCACHE_DIR}"                     >> "$GITHUB_ENV"
+          echo "CCACHE_BASEDIR=${CCACHE_BASEDIR}"             >> "$GITHUB_ENV"
+          echo "CCACHE_COMPRESS=true"                         >> "$GITHUB_ENV"
+          echo "CCACHE_COMPRESSLEVEL=5"                       >> "$GITHUB_ENV"
+          echo "CCACHE_SLOPPINESS=time_macros,file_stat"      >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=4G"                            >> "$GITHUB_ENV"
+          echo "PATH=/usr/lib/ccache:$PATH"                   >> "$GITHUB_ENV"
 
-      # ===== 检出目标内核源码 =====
       - name: Checkout target kernel repo (specific branch) to kernel-src
         if: ${{ inputs.kernel_branch != '' }}
         uses: actions/checkout@v4
@@ -128,7 +121,6 @@ jobs:
           git reset --hard HEAD
           git clean -fd
 
-      # 预检 defconfig：vendor/picasso_defconfig
       - name: Preflight checks (vendor/picasso_defconfig)
         working-directory: kernel-src
         run: |
@@ -139,7 +131,6 @@ jobs:
             exit 1
           fi
 
-      # ===== 下载并应用 LXC 补丁（远程） =====
       - name: Apply LXC patches from remote
         working-directory: kernel-src
         run: |
@@ -170,6 +161,7 @@ jobs:
       - name: Prepare AnyKernel3
         working-directory: kernel-src
         run: |
+          set -e
           rm -rf out/ anykernel/
           git clone --depth=1 https://github.com/liyafe1997/AnyKernel3 -b kona anykernel
 
@@ -185,7 +177,6 @@ jobs:
         run: |
           make ${MAKE_ARGS} vendor/picasso_defconfig
 
-      # ===== 关闭昂贵的调试项（减少编译时间/体积） =====
       - name: Speed-focused config tuning
         working-directory: kernel-src
         run: |
@@ -196,7 +187,6 @@ jobs:
             -d DEBUG_KERNEL
           yes "" | make ${MAKE_ARGS} olddefconfig
 
-      # ===== 容器内核项校验（moby 官方脚本） =====
       - name: Verify Docker/LXC requirements via moby check-config.sh
         working-directory: kernel-src
         run: |
@@ -204,12 +194,9 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh -o /tmp/check-config.sh
           chmod +x /tmp/check-config.sh
           /tmp/check-config.sh out/.config
-          # 直接指定 .config 的校验是官方推荐用法。[4](https://linuxvox.com/blog/kern-log-linux/)
 
-      # ===== 注入 state/__state 兼容宏并替换调用（B 方案） =====
       - name: Inject task_struct state compatibility macro & adapt calls
         working-directory: kernel-src
-        shell: bash
         run: |
           set -e
           cd kernel/sched
@@ -231,15 +218,12 @@ EOF
           fi
           sed -E -i 's/READ_ONCE\(\s*([[:alnum:]_\.]+)->__state\s*\)/READ_TASK_STATE(\1)/g' fair.c
 
-      # ===== 编译：默认 V=0，加速；仍保存完整日志 =====
       - name: Build kernel (fast, capture logs)
         working-directory: kernel-src
-        shell: bash
         run: |
           set -e
-          export LD=ld.lld     # Clang + lld 组合更快
-          # 默认非详细（V=0），降低控制台 IO 开销；仍落盘日志以便调试。[3](https://lundiiioutlook-my.sharepoint.com/personal/leo_lundiiioutlook_onmicrosoft_com/Documents/Microsoft%20Copilot%20Chat%20%E6%96%87%E4%BB%B6/build.sh)
-          make ${MAKE_ARGS} -j$(nproc) 2>&1 | tee out/build.log
+          export LD=ld.lld
+          make ${MAKE_ARGS} -j"$(nproc)" 2>&1 | tee out/build.log
           [[ -f out/arch/arm64/boot/Image ]] || { echo "::error::未生成 out/arch/arm64/boot/Image（详见 out/build.log）"; exit 1; }
           echo "✅ Build OK: out/arch/arm64/boot/Image"
 
@@ -270,9 +254,9 @@ EOF
           GIT_COMMIT_ID="$(git rev-parse --short=8 HEAD)"
           ZIP_FILENAME="Kernel_AOSP_${TARGET_DEVICE}_NoKernelSU_$(date +'%Y%m%d_%H%M%S')_anykernel3_${GIT_COMMIT_ID}.zip"
           (cd anykernel && zip -r9 "${ZIP_FILENAME}" ./* -x .git .gitignore out/ ./*.zip)
-          mv anykernel/${ZIP_FILENAME} .
-          echo "ZIP_FILENAME=${ZIP_FILENAME}" >> $GITHUB_ENV
-          echo "KERNEL_COMMIT=${GIT_COMMIT_ID}" >> $GITHUB_ENV
+          mv anykernel/"${ZIP_FILENAME}" .
+          echo "ZIP_FILENAME=${ZIP_FILENAME}" >> "$GITHUB_ENV"
+          echo "KERNEL_COMMIT=${GIT_COMMIT_ID}" >> "$GITHUB_ENV"
 
       - name: Restore defconfig local version string
         working-directory: kernel-src
@@ -291,15 +275,14 @@ EOF
             kernel-src/out/arch/arm64/boot/dts/**/*.dtb
           if-no-files-found: warn
 
-      # ===== 发布到 Release（创建 tag 并上传 AnyKernel ZIP） =====
       - name: Prepare release tag/name
         id: relmeta
-        shell: bash
         run: |
+          set -e
           TAG="picasso-aosp-${{ github.run_id }}-${{ github.run_number }}"
           NAME="Kernel AOSP picasso (${TAG}) [kernel commit: ${KERNEL_COMMIT}]"
-          echo "tag=${TAG}"  >> $GITHUB_OUTPUT
-          echo "name=${NAME}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}"  >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Create and push tag
         run: |
