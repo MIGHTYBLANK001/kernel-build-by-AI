@@ -1,5 +1,5 @@
 
-name: Build kernel (picasso/AOSP) – fast workflow + release (auto-adapt task_struct state)
+name: Build kernel (picasso/AOSP) – fast workflow + release (fix host ld & explicit target toolchain)
 
 on:
   workflow_dispatch:
@@ -24,7 +24,6 @@ jobs:
       TOOLCHAIN_PATH: ${{ github.workspace }}/../proton-clang/proton-clang-20210522/bin
       CCACHE_DIR: $HOME/.cache/ccache_picasso
       CCACHE_BASEDIR: ${{ github.workspace }}/kernel-src
-      MAKE_ARGS: "ARCH=arm64 SUBARCH=arm64 O=out CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
 
     steps:
       - name: Checkout workflow repo
@@ -43,7 +42,7 @@ jobs:
           echo "safe_repo=${SAFE_REPO}"  >> "$GITHUB_OUTPUT"
           echo "safe_branch=${KBRANCH}" >> "$GITHUB_OUTPUT"
 
-      # 缓存 Proton Clang（避免每次克隆；该项目的 LTO/PGO 也有助于缩短编译时间）
+      # 缓存 Proton Clang（避免每次克隆）
       - name: Cache Proton Clang
         id: clangcache
         uses: actions/cache@v4
@@ -61,12 +60,39 @@ jobs:
           mkdir -p "${TOOLCHAIN_ROOT}"
           git clone --depth=1 --branch "${TOOLCHAIN_VERSION}" https://github.com/kdrag0n/proton-clang \
             "${TOOLCHAIN_ROOT}/proton-clang-${TOOLCHAIN_VERSION}"
-          # Proton Clang README 说明其为 LLVM/Clang 内核工具链，且采用 LTO/PGO 优化编译时间。[3](https://github.com/liyafe1997/AnyKernel3)
+          # Proton Clang 说明：LLVM/Clang 工具链，包含 binutils，且采用 LTO/PGO 优化编译时长。[5](https://github.com/liyafe1997/AnyKernel3)
 
-      - name: Add toolchain to PATH
+      # **关键修正**：不要前置 PATH；改为追加到末尾，并显式导出目标工具链变量
+      - name: Configure toolchains (keep system ld for host; explicit target tool paths)
         shell: bash
         run: |
-          echo "PATH=${TOOLCHAIN_PATH}:$PATH" >> "$GITHUB_ENV"
+          set -e
+          # 追加，不要覆盖系统 /usr/bin/ld
+          echo "PATH=$PATH:${TOOLCHAIN_PATH}"    >> "$GITHUB_ENV"
+
+          # 目标内核使用的 Clang/LLD/LLVM 工具（显式设置，避免 PATH 影响）
+          echo "CC=${TOOLCHAIN_PATH}/clang"       >> "$GITHUB_ENV"
+          echo "LD=${TOOLCHAIN_PATH}/ld.lld"      >> "$GITHUB_ENV"
+          echo "AR=${TOOLCHAIN_PATH}/llvm-ar"     >> "$GITHUB_ENV"
+          echo "NM=${TOOLCHAIN_PATH}/llvm-nm"     >> "$GITHUB_ENV"
+          echo "OBJCOPY=${TOOLCHAIN_PATH}/llvm-objcopy" >> "$GITHUB_ENV"
+          echo "STRIP=${TOOLCHAIN_PATH}/llvm-strip"     >> "$GITHUB_ENV"
+
+          # 主机侧始终用系统编译器/链接器构建 fixdep 等（避免旧 ld 不支持 .relr.dyn）
+          echo "HOSTCC=gcc"                       >> "$GITHUB_ENV"
+          echo "HOSTCXX=g++"                      >> "$GITHUB_ENV"
+          echo "HOSTLDFLAGS="                     >> "$GITHUB_ENV"   # 可按需追加主机链接标志
+          # 参考：Kbuild 对 HOSTCC/HOSTCFLAGS/HOSTLDFLAGS 的定义。[6](https://docs.kernel.org/kbuild/kbuild.html)
+
+      - name: Show host & target toolchain versions
+        shell: bash
+        run: |
+          which cc      || true; cc      --version || true
+          which gcc     || true; gcc     --version || true
+          which ld      || true; ld      --version  || true
+          which clang   || true; clang   --version  || true
+          which ld.lld  || true; ld.lld  --version  || true
+          echo "CC=${CC}"; echo "LD=${LD}"
 
       - name: Install build dependencies
         shell: bash
@@ -92,7 +118,6 @@ jobs:
           max-size: 4G
           create-symlink: true
           job-summary: "CCache 统计"
-        # ccache-action 封装了 actions/cache，并支持 symlink 与大小控制。[4](https://www.cnblogs.com/smartljy/p/18600618)
 
       - name: Configure ccache knobs
         shell: bash
@@ -104,7 +129,6 @@ jobs:
           echo "CCACHE_SLOPPINESS=time_macros,file_stat"      >> "$GITHUB_ENV"
           echo "CCACHE_MAXSIZE=4G"                            >> "$GITHUB_ENV"
           echo "PATH=/usr/lib/ccache:$PATH"                   >> "$GITHUB_ENV"
-        # 以上为 ccache 官方文档推荐的常用加速参数。[5](https://github.com/hendrikmuhs/ccache-action/blob/main/action.yml)
 
       # 检出目标内核源码
       - name: Checkout target kernel repo (specific branch) to kernel-src
@@ -188,11 +212,17 @@ jobs:
           GIT_COMMIT_ID="$(git rev-parse --short=8 HEAD)"
           sed -i "s/-perf/-$(date +%Y%m%d)-${GIT_COMMIT_ID}-perf/g" arch/arm64/configs/vendor/picasso_defconfig
 
-      - name: make vendor/picasso_defconfig
+      # **注意**：此处 make 会构建 host 工具（fixdep），我们已强制 HOSTCC=gcc 并避免覆盖系统 ld
+      - name: make vendor/picasso_defconfig (host uses system ld)
         working-directory: kernel-src
         shell: bash
         run: |
-          make ${MAKE_ARGS} vendor/picasso_defconfig
+          make O=out ARCH=arm64 SUBARCH=arm64 \
+               CC="${CC}" LD="${LD}" AR="${AR}" NM="${NM}" OBJCOPY="${OBJCOPY}" STRIP="${STRIP}" \
+               HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" \
+               CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+               CLANG_TRIPLE=aarch64-linux-gnu- \
+               vendor/picasso_defconfig
 
       # 关闭昂贵的调试项（减少编译时间/体积）
       - name: Speed-focused config tuning
@@ -204,8 +234,7 @@ jobs:
             -d DEBUG_INFO \
             -d GDB_SCRIPTS \
             -d DEBUG_KERNEL
-          yes "" | make ${MAKE_ARGS} olddefconfig
-        # Kbuild 支持通过 scripts/config 批量调整配置；V/KBUILD_VERBOSE 控制输出详略。[6](https://lundiiioutlook-my.sharepoint.com/personal/leo_lundiiioutlook_onmicrosoft_com/Documents/Microsoft%20Copilot%20Chat%20%E6%96%87%E4%BB%B6/build.sh)
+          yes "" | make O=out ARCH=arm64 SUBARCH=arm64 olddefconfig
 
       # Docker/LXC 必要项校验（moby 官方脚本）
       - name: Verify Docker/LXC requirements via moby check-config.sh
@@ -216,15 +245,14 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh -o /tmp/check-config.sh
           chmod +x /tmp/check-config.sh
           /tmp/check-config.sh out/.config
-        # 这是 Docker/Moby 官方提供的内核配置校验脚本。[7](https://linuxvox.com/blog/kern-log-linux/)
+        # Docker/Moby 官方脚本用于容器所需内核配置核验。[8](https://linuxvox.com/blog/kern-log-linux/)
 
-      # ===== 新方案：不注入头文件；按源码自动改写 __state 用法 =====
+      # **兼容方案**：按头文件实际情况改写 fair.c 的 __state/state 引用，避免 YAML heredoc
       - name: Adapt __state usages to current kernel (no heredoc)
         working-directory: kernel-src
         shell: bash
         run: |
           set -e
-          # 如果头文件没有 __state，则说明该树使用 task_struct->state；需要改写 fair.c
           if ! grep -R -q '\b__state\b' include/linux/sched.h; then
             echo "Detected task_struct.state (no __state); rewriting kernel/sched/fair.c ..."
             sed -E -i 's/READ_ONCE\(\s*([[:alnum:]_.]+)->__state\s*\)/READ_ONCE(\1->state)/g' kernel/sched/fair.c
@@ -232,16 +260,20 @@ jobs:
           else
             echo "__state field present; no rewrite needed."
           fi
-        # 上游在 5.14 左右引入 __state；部分旧树仍为 state，因此按实际头文件自动改写最稳妥。[1](https://dev.to/arif_hossain/basic-github-actions-checkout-3588)
+        # 字段差异来自上游在 5.14 左右的迁移，按源码树自动适配更稳妥。[9](https://dev.to/arif_hossain/basic-github-actions-checkout-3588)
 
-      # 编译：默认 V=0，加速；仍保存完整日志
+      # 编译：保存完整日志
       - name: Build kernel (fast, capture logs)
         working-directory: kernel-src
         shell: bash
         run: |
           set -e
-          export LD=ld.lld
-          make ${MAKE_ARGS} -j"$(nproc)" 2>&1 | tee out/build.log
+          make O=out ARCH=arm64 SUBARCH=arm64 \
+               CC="${CC}" LD="${LD}" AR="${AR}" NM="${NM}" OBJCOPY="${OBJCOPY}" STRIP="${STRIP}" \
+               HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" \
+               CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+               CLANG_TRIPLE=aarch64-linux-gnu- \
+               -j"$(nproc)" 2>&1 | tee out/build.log
           [[ -f out/arch/arm64/boot/Image ]] || { echo "::error::未生成 out/arch/arm64/boot/Image（详见 out/build.log）"; exit 1; }
           echo "✅ Build OK: out/arch/arm64/boot/Image"
 
@@ -272,7 +304,7 @@ jobs:
           cp out/arch/arm64/boot/Image anykernel/kernels/
           cp out/arch/arm64/boot/dtb    anykernel/kernels/
           GIT_COMMIT_ID="$(git rev-parse --short=8 HEAD)"
-          ZIP_FILENAME="Kernel_AOSP_${TARGET_DEVICE}_NoKernelSU_$(date +'%Y%m%d_%H%M%S')_anykernel3_${GIT_COMMIT_ID}.zip"
+          ZIP_FILENAME="Kernel_AOSP_${TARGET_DEVICE}_NoKernelSU_$(date +%Y%m%d_%H%M%S')_anykernel3_${GIT_COMMIT_ID}.zip"
           (cd anykernel && zip -r9 "${ZIP_FILENAME}" ./* -x .git .gitignore out/ ./*.zip)
           mv anykernel/"${ZIP_FILENAME}" .
           echo "ZIP_FILENAME=${ZIP_FILENAME}" >> "$GITHUB_ENV"
@@ -295,7 +327,6 @@ jobs:
             kernel-src/out/arch/arm64/boot/Image
             kernel-src/out/arch/arm64/boot/dts/**/*.dtb
           if-no-files-found: warn
-        # upload-artifact 不允许名称含 / \ : * ? " < > | CR LF；我们已使用安全名避免。[8](https://segmentfault.com/a/1190000045270503)
 
       # 发布到 Release（创建 tag 并上传 AnyKernel ZIP）
       - name: Prepare release tag/name
@@ -327,4 +358,3 @@ jobs:
             kernel-src/${{ env.ZIP_FILENAME }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # 使用 softprops/action-gh-release 创建发布并上传资产；需顶层 permissions: contents: write。[9](https://github.com/marketplace/actions/create-tag-release)[10](https://git.slzz.org/InTheForest/moby/commit/82fda400b8a2528b1b90e64fc4be6827afbd04ed)
