@@ -121,11 +121,49 @@ jobs:
           clang-${{ inputs.llvm_version }} --version || true
           ld.lld-${{ inputs.llvm_version }} --version || true
 
+      # 新增：将无后缀工具映射到指定版本（解决 ld.lld: not found）
+      - name: Map unsuffixed LLVM tool names to selected version
+        shell: bash
+        run: |
+          set -eux
+          VER="${{ inputs.llvm_version }}"
+          # 使用 update-alternatives 建立无后缀别名
+          sudo update-alternatives --install /usr/bin/clang      clang      /usr/bin/clang-${VER}      100
+          sudo update-alternatives --install /usr/bin/clang++    clang++    /usr/bin/clang++-${VER}    100
+          sudo update-alternatives --install /usr/bin/ld.lld     ld.lld     /usr/bin/ld.lld-${VER}     100
+          sudo update-alternatives --install /usr/bin/llvm-ar    llvm-ar    /usr/bin/llvm-ar-${VER}    100
+          sudo update-alternatives --install /usr/bin/llvm-nm    llvm-nm    /usr/bin/llvm-nm-${VER}    100
+          sudo update-alternatives --install /usr/bin/llvm-objcopy llvm-objcopy /usr/bin/llvm-objcopy-${VER} 100
+          sudo update-alternatives --install /usr/bin/llvm-objdump llvm-objdump /usr/bin/llvm-objdump-${VER} 100
+          sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-${VER} 100
+          # 验证无后缀命令
+          ld.lld --version
+          clang  --version
+
       - name: Clone kernel source
         shell: bash
         run: |
           set -eux
           git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo_url }}" kernel-src
+
+      # 新增：初始化子模块（解决 drivers/kernelsu/Kconfig 缺失）
+      - name: Init submodules (if any)
+        working-directory: kernel-src
+        shell: bash
+        run: |
+          set -eux
+          git submodule update --init --recursive || true
+
+          # 若仍缺少 drivers/kernelsu/Kconfig，则创建最小占位 Kconfig，避免 Kconfig 解析失败
+          if [ ! -f drivers/kernelsu/Kconfig ]; then
+            echo "⚠️ drivers/kernelsu/Kconfig 仍不存在，创建最小占位 Kconfig 以继续构建。"
+            mkdir -p drivers/kernelsu
+            cat > drivers/kernelsu/Kconfig <<'EOF'
+menu "KernelSU (stub)"
+# 占位以避免 Kconfig 失败；实际功能未启用
+endmenu
+EOF
+          fi
 
       - name: Resolve defconfig path
         id: defcfg
@@ -328,3 +366,12 @@ jobs:
             AnyKernel3/${{ steps.makezip.outputs.ZIPPATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 清理：卸载工作空间，删除镜像文件
+      - name: Cleanup build workspace
+        if: always()
+        shell: bash
+        run: |
+          set -eux
+          sudo umount /mnt/workspace || true
+          sudo rm -f /mnt/workspace.img || true
