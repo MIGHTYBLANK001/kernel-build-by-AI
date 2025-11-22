@@ -1,23 +1,11 @@
 
-name: Rosemary Kernel Build (segmented + LXC patch, strict from build.sh)
+name: Driftwood Kernel CI
 
 on:
   workflow_dispatch:
     inputs:
-      kernel_repo_url:
-        description: "内核源码仓库地址（例如 https://github.com/YourOrg/your-kernel.git ）"
-        required: true
-        type: string
-      device_codename:
-        description: "机型代号（用于 AnyKernel3 分支与目录名，例如 picasso）"
-        required: true
-        type: string
-      defconfig_path:
-        description: "完整的 defconfig 路径（例如 arch/arm64/configs/vendor/picasso_user_defconfig）"
-        required: true
-        type: string
       operation:
-        description: "build.sh 操作：all | cleanbuild | flashable | kernelonly | defconfig | savedefconfig | version"
+        description: "选择构建操作：all / cleanbuild / flashable / defconfig / kernelonly / version / savedefconfig"
         required: true
         default: "all"
         type: choice
@@ -25,411 +13,467 @@ on:
           - all
           - cleanbuild
           - flashable
-          - kernelonly
           - defconfig
-          - savedefconfig
+          - kernelonly
           - version
-      noksu:
-        description: "不启用 KernelSU（仅对 all/defconfig 生效；等价于传入 'noksu'）"
-        required: false
-        default: false
+          - savedefconfig
+      with_kernelsu:
+        description: "是否包含 KernelSU（true=包含，false=禁用）"
+        required: true
+        default: "true"
         type: boolean
+      kernel_repo_url:
+        description: "内核源码仓库链接（留空时使用当前仓库）"
+        required: false
+        default: ""
+        type: string
+      kernel_repo_ref:
+        description: "内核源码分支或标签（仅在指定仓库链接时生效）"
+        required: false
+        default: "main"
+        type: string
+
+  push:
+    branches:
+      - main
+    paths:
+      - "**/*.c"
+      - "**/*.h"
+      - "arch/**"
+      - "include/**"
+      - "Makefile"
+      - "Kbuild"
+      - ".github/workflows/kernel-build.yml"
+
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  prep_01:
-    name: 01 · 准备环境与工具链
+  build:
+    name: Build (${{ matrix.device }})
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # === 默认设备（可复制扩展更多设备/defconfig）===
+          - device: picasso
+            defconfig_name: vendor/picasso_user_defconfig
+            target_kernel_name: Driftwood-Kernel-picasso
+            anykernel_url: https://codeload.github.com/EndCredits/AnyKernel3/zip/refs/heads/picasso
+            anykernel_path: AnyKernel3-picasso
+            anykernel_file: anykernel.zip
+
+          # 示例：添加另一个设备（请替换为真实 defconfig）
+          # - device: device2
+          #   defconfig_name: vendor/device2_user_defconfig
+          #   target_kernel_name: Driftwood-Kernel-device2
+          #   anykernel_url: https://codeload.github.com/EndCredits/AnyKernel3/zip/refs/heads/device2
+          #   anykernel_path: AnyKernel3-device2
+          #   anykernel_file: anykernel.zip
+
+    env:
+      ARCH: arm64
+      CC: clang                 # 将在步骤中用 ccache 包装
+      LD: ld.lld
+      CLANG_TRIPLE: aarch64-linux-gnu-
+      CROSS_COMPILE: aarch64-linux-gnu-
+      CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
+      CC_ADDITION_FLAGS: "LD=ld.lld"
+      OUT: .out                 # ✅ 工作目录内的 .out，便于缓存与管理
+
+      DEFCONFIG_PATH: arch/arm64/configs
+      DISABLE_KSU_FRAGMENT: vendor/disable_ksu.config
+      TARGET_KERNEL_FILE: arch/arm64/boot/Image
+      TARGET_KERNEL_DTB: arch/arm64/boot/dtb
+      TARGET_KERNEL_DTBO: arch/arm64/boot/dtbo.img
+
+      # 来自矩阵
+      DEFCONFIG_NAME: ${{ matrix.defconfig_name }}
+      TARGET_KERNEL_NAME: ${{ matrix.target_kernel_name }}
+      ANYKERNEL_URL: ${{ matrix.anykernel_url }}
+      ANYKERNEL_PATH: ${{ matrix.anykernel_path }}
+      ANYKERNEL_FILE: ${{ matrix.anykernel_file }}
+
+      # ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+      # LXC utils 下载地址（你提供的地址）
+      LXC_UTILS_URL: https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/Patchs/LXC_utils.zip
+
+      # 默认内核源码目录（若提供外部链接则使用 kernel-src）
+      KERNEL_SRC_DIR: kernel-src
+
     steps:
-      - name: Checkout workflow repo
+      - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Install toolchain & utilities
+
+      - name: Cache APT packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/apt
+            /var/lib/apt/lists
+          key: apt-${{ runner.os }}-${{ hashFiles('.github/workflows/kernel-build.yml') }}
+          restore-keys: |
+            apt-${{ runner.os }}-
+
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
-            clang llvm lld \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi g++-arm-linux-gnueabi \
-            bc curl unzip zip git patch
-          echo "PATH=/usr/bin:${PATH}" >> $GITHUB_ENV
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            g++-arm-linux-gnueabi \
+            clang \
+            lld \
+            llvm \
+            bc \
+            flex \
+            bison \
+            libssl-dev \
+            libncurses-dev \
+            zip \
+            unzip \
+            curl \
+            git \
+            rsync \
+            python3 \
+            ca-certificates \
+            ccache \
+            patch
+          clang --version
+          ld.lld --version
+          ccache --version
 
-  fetch_02:
-    name: 02 · 拉取内核源码与输入校验
-    runs-on: ubuntu-latest
-    needs: [prep_01]
-    outputs:
-      kernel_dir: ${{ steps.outvars.outputs.kernel_dir }}
-    steps:
-      - name: Checkout workflow repo
-        uses: actions/checkout@v4
-      - name: Clone kernel source
-        id: outvars
-        run: |
-          set -euo pipefail
-          git clone --depth=1 "${{ inputs.kernel_repo_url }}" kernel
-          echo "kernel_dir=${GITHUB_WORKSPACE}/kernel" >> $GITHUB_OUTPUT
-      - name: Validate inputs
-        run: |
-          set -euo pipefail
-          DEFCONFIG_FULL="${{ inputs.defconfig_path }}"
-          if [[ ! "${DEFCONFIG_FULL}" =~ ^arch/arm64/configs/.+ ]]; then
-            echo "❌ defconfig_path 不在 arch/arm64/configs 下：${DEFCONFIG_FULL}"
-            exit 1
-          fi
-          CODENAME="${{ inputs.device_codename }}"
-          if [[ -z "${CODENAME}" ]]; then
-            echo "❌ device_codename 不能为空"
-            exit 1
-          fi
-          echo "✅ 输入校验通过：defconfig=${DEFCONFIG_FULL}，codename=${CODENAME}"
-
-  derive_vars_03:
-    name: 03 · 计算派生变量（THREAD/版本等）
-    runs-on: ubuntu-latest
-    needs: [fetch_02]
-    outputs:
-      DEFCONFIG_PATH: ${{ steps.vars.outputs.DEFCONFIG_PATH }}
-      DEFCONFIG_NAME: ${{ steps.vars.outputs.DEFCONFIG_NAME }}
-      LOCAL_VERSION_NUMBER: ${{ steps.vars.outputs.LOCAL_VERSION_NUMBER }}
-      TARGET_KERNEL_MOD_VERSION: ${{ steps.vars.outputs.TARGET_KERNEL_MOD_VERSION }}
-      CURRENT_TIME: ${{ steps.vars.outputs.CURRENT_TIME }}
-      START_SEC: ${{ steps.vars.outputs.START_SEC }}
-    steps:
-      - name: Checkout workflow repo
-        uses: actions/checkout@v4
-      - name: Derive variables (strict from build.sh)
-        id: vars
-        working-directory: ${{ needs.fetch_02.outputs.kernel_dir }}
-        run: |
-          set -euo pipefail
-          echo "THREAD=$(nproc --all)" >> $GITHUB_ENV
-
-          DEFCONFIG_FULL="${{ inputs.defconfig_path }}"
-          DEFCONFIG_PATH="$(dirname "${DEFCONFIG_FULL}")"
-          DEFCONFIG_NAME="$(basename "${DEFCONFIG_FULL}")"
-
-          LOCAL_VERSION_NUMBER="$(cat "${DEFCONFIG_PATH}/${DEFCONFIG_NAME}" \
-            | grep CONFIG_LOCALVERSION= \
-            | cut -d '=' -f 2 \
-            | sed 's/"//g' \
-            | sed 's/-Driftwood-//g')"
-
-          TARGET_KERNEL_MOD_VERSION="$(make kernelversion)-${LOCAL_VERSION_NUMBER}"
-          CURRENT_TIME="$(date '+%Y-%m%d%H%M')"
-          START_SEC="$(date +%s)"
-
-          echo "DEFCONFIG_PATH=${DEFCONFIG_PATH}" >> $GITHUB_OUTPUT
-          echo "DEFCONFIG_NAME=${DEFCONFIG_NAME}" >> $GITHUB_OUTPUT
-          echo "LOCAL_VERSION_NUMBER=${LOCAL_VERSION_NUMBER}" >> $GITHUB_OUTPUT
-          echo "TARGET_KERNEL_MOD_VERSION=${TARGET_KERNEL_MOD_VERSION}" >> $GITHUB_OUTPUT
-          echo "CURRENT_TIME=${CURRENT_TIME}" >> $GITHUB_OUTPUT
-          echo "START_SEC=${START_SEC}" >> $GITHUB_OUTPUT
-
-  prebuild_04a:
-    name: 04a · 编译前（clean + defconfig）
-    runs-on: ubuntu-latest
-    needs: [fetch_02, derive_vars_03]
-    if: ${{ inputs.operation != 'version' && inputs.operation != 'savedefconfig' }}
-    outputs:
-      OUT_DIR: ${{ steps.outpath.outputs.OUT_DIR }}
-    steps:
-      - name: Checkout workflow repo
-        uses: actions/checkout@v4
-      - name: Pre-Build steps (strictly mirror build.sh)
-        id: pre
+      # 解析与设置内核源码目录：若未提供链接则使用当前仓库
+      - name: Resolve kernel source directory
         shell: bash
-        working-directory: ${{ needs.fetch_02.outputs.kernel_dir }}
-        env:
-          ARCH: arm64
-          CC: clang
-          LD: ld.lld
-          CLANG_TRIPLE: aarch64-linux-gnu-
-          CROSS_COMPILE: aarch64-linux-gnu-
-          CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
-          OUT: ../out
-          DISABLE_KSU_FRAGMENT: vendor/disable_ksu.config
-          DEFCONFIG_PATH: ${{ needs.derive_vars_03.outputs.DEFCONFIG_PATH }}
-          DEFCONFIG_NAME: ${{ needs.derive_vars_03.outputs.DEFCONFIG_NAME }}
         run: |
-          set -euo pipefail
-          THREAD="$(nproc --all)"
-          CC_ADDITION_FLAGS="LD=${LD}"
-          WITH_KERNELSU=1
-          [[ "${{ inputs.noksu }}" == "true" ]] && WITH_KERNELSU=0
-
-          clean() {
-            echo "--- Cleaning source tree & out ---"
-            make mrproper -j"${THREAD}"
-            make clean -j"${THREAD}"
-            rm -rf "${OUT}"
-          }
-
-          make_defconfig() {
-            echo "--- Building Defconfig ---"
-            DEFCONF_NAME="${DEFCONFIG_NAME}"
-            if [[ "${WITH_KERNELSU}" == "0" ]]; then
-              DEFCONF_NAME="${DEFCONF_NAME} ${DISABLE_KSU_FRAGMENT}"
-            fi
-            make CC="$CC" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
-                 CLANG_TRIPLE="$CLANG_TRIPLE" LLVM=1 LLVM_IAS=1 ${CC_ADDITION_FLAGS} O="$OUT" -j"${THREAD}" ${DEFCONF_NAME}
-          }
-
-          op="${{ inputs.operation }}"
-          if [[ "${op}" == "cleanbuild" ]]; then
-            clean
-            make_defconfig
-          elif [[ "${op}" == "kernelonly" || "${op}" == "all" || "${op}" == "defconfig" ]]; then
-            make_defconfig
-          elif [[ "${op}" == "flashable" ]]; then
-            echo "flashable: 不执行 defconfig（与脚本一致：需已有构建）"
+          set -e
+          if [ -z "${{ inputs.kernel_repo_url }}" ]; then
+            echo "未指定内核源码仓库链接，使用当前仓库作为源码目录"
+            echo "KERNEL_SRC_DIR=." >> $GITHUB_ENV
           else
-            echo "version/savedefconfig 在其他阶段处理，这里不运行。"
+            echo "将从外部仓库克隆内核源码到 kernel-src"
+            echo "KERNEL_SRC_DIR=kernel-src" >> $GITHUB_ENV
           fi
-      - name: OUT dir path
-        id: outpath
-        run: |
-          echo "OUT_DIR=out" >> $GITHUB_OUTPUT
-          echo "OUT_DIR_UP=../out" >> $GITHUB_OUTPUT
-      - name: Upload pre-build snapshot
-        uses: actions/upload-artifact@v4
-        with:
-          name: pre-build-out
-          path: |
-            out
-            ../out
-          if-no-files-found: ignore
-          retention-days: 3
 
-  prebuild_apply_lxc_04a2:
-    name: 04a2 · 编译前打 LXC 补丁（Docker/qtaguid/runcpatch）
-    runs-on: ubuntu-latest
-    needs: [fetch_02, derive_vars_03, prebuild_04a]
-    if: ${{ inputs.operation == 'cleanbuild' || inputs.operation == 'kernelonly' || inputs.operation == 'all' }}
-    steps:
-      - name: Checkout workflow repo
-        uses: actions/checkout@v4
+      # 若提供了外部链接则克隆
+      - name: Clone kernel source (if provided)
+        if: ${{ inputs.kernel_repo_url != '' }}
+        shell: bash
+        run: |
+          set -e
+          rm -rf kernel-src
+          echo "Cloning: ${{ inputs.kernel_repo_url }} (ref: ${{ inputs.kernel_repo_ref }})"
+          git clone --depth 1 --branch "${{ inputs.kernel_repo_ref }}" "${{ inputs.kernel_repo_url }}" kernel-src
+          echo "克隆完成：$(ls -la kernel-src | wc -l) 项目文件"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ matrix.device }}-${{ inputs.with_kernelsu }}-${{ inputs.kernel_repo_url }}-${{ inputs.kernel_repo_ref }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ matrix.device }}-
+            ccache-${{ runner.os }}-
+
+      - name: Cache build output (.out)
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/${{ env.KERNEL_SRC_DIR }}/.out
+          key: out-${{ runner.os }}-${{ matrix.device }}-${{ inputs.with_kernelsu }}-${{ inputs.kernel_repo_url }}-${{ inputs.kernel_repo_ref }}
+          restore-keys: |
+            out-${{ runner.os }}-${{ matrix.device }}-
+            out-${{ runner.os }}-
+
+      - name: Prepare environment
+        id: prep
+        shell: bash
+        working-directory: ${{ env.KERNEL_SRC_DIR }}
+        run: |
+          set -e
+          THREADS=$(nproc --all)
+          echo "THREADS=$THREADS" >> $GITHUB_ENV
+
+          START_SEC=$(date +%s)
+          CURRENT_TIME=$(date '+%Y-%m%d%H%M')
+          echo "START_SEC=$START_SEC" >> $GITHUB_ENV
+          echo "CURRENT_TIME=$CURRENT_TIME" >> $GITHUB_ENV
+
+          # 使用 ccache 包装 clang
+          echo "CC=ccache clang" >> $GITHUB_ENV
+
+          # 计算 LOCAL_VERSION_NUMBER 与 kernelversion
+          DEFCONFIG_FILE="$DEFCONFIG_PATH/$DEFCONFIG_NAME"
+          if [ ! -f "$DEFCONFIG_FILE" ]; then
+            echo "❌ 未找到 defconfig: $DEFCONFIG_FILE"
+            ls -la "$DEFCONFIG_PATH" || true
+            exit 1
+          fi
+          LOCAL_VERSION_NUMBER=$(grep -E '^CONFIG_LOCALVERSION=' "$DEFCONFIG_FILE" | cut -d '=' -f 2 | sed 's/"//g' | sed 's/-Driftwood-//g')
+          echo "LOCAL_VERSION_NUMBER=$LOCAL_VERSION_NUMBER" >> $GITHUB_ENV
+
+          KVER=$(make kernelversion)
+          TARGET_KERNEL_MOD_VERSION="${KVER}-${LOCAL_VERSION_NUMBER}"
+          echo "TARGET_KERNEL_MOD_VERSION=$TARGET_KERNEL_MOD_VERSION" >> $GITHUB_ENV
+
+          # KernelSU 开关
+          if [ "${{ inputs.with_kernelsu }}" = "false" ]; then
+            echo "WITH_KERNELSU=0" >> $GITHUB_ENV
+            echo "KernelSU disabled"
+          else
+            echo "WITH_KERNELSU=1" >> $GITHUB_ENV
+          fi
+
+          echo "operation: ${{ inputs.operation }}"
+          echo "device: ${{ matrix.device }}"
+          echo "defconfig: $DEFCONFIG_NAME"
+          echo "threads: $THREADS"
+          echo "kernel source dir: $PWD"
+
+      # ---------- LXC 补丁（在编译前执行） ----------
       - name: Apply LXC patches (enable Docker, qtaguid, runcpatch)
         shell: bash
-        working-directory: ${{ needs.fetch_02.outputs.kernel_dir }}
-        env:
-          DEFCONFIG_PATH: ${{ needs.derive_vars_03.outputs.DEFCONFIG_PATH }}
-          DEFCONFIG_NAME: ${{ needs.derive_vars_03.outputs.DEFCONFIG_NAME }}
+        working-directory: ${{ env.KERNEL_SRC_DIR }}
         run: |
-          set -euo pipefail
+          set -e
           echo "🔧 正在为内核安装 LXC 补丁..."
 
-          # 优先使用仓库内 Patchs/LXC_utils.zip；若不存在则从远程下载
-          if [[ -f "Patchs/LXC_utils.zip" ]]; then
-            echo "使用仓库内 Patchs/LXC_utils.zip"
-            rm -rf utils && unzip -o "Patchs/LXC_utils.zip" -d utils
-          else
-            echo "从远程下载 LXC_utils.zip"
-            curl -L "https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/Patchs/LXC_utils.zip" -o LXC_utils.zip
-            rm -rf utils && unzip -o LXC_utils.zip -d utils
-          fi
+          # 下载并解压 utils
+          rm -rf utils LXC_utils.zip
+          echo "➜ 下载 LXC utils: $LXC_UTILS_URL"
+          curl -L "$LXC_UTILS_URL" -o LXC_utils.zip
+          unzip -o LXC_utils.zip -d utils
 
-          # 基本文件校验
-          test -f utils/Kconfig || { echo "❌ utils/Kconfig 缺失"; ls -la utils || true; exit 1; }
-          test -f utils/runcpatch.sh || { echo "❌ utils/runcpatch.sh 缺失"; ls -la utils || true; exit 1; }
-
-          # 在根 Kconfig 引入 utils/Kconfig
+          # 将 utils/Kconfig 引入顶层 Kconfig（若未引入）
           if ! grep -q 'source "utils/Kconfig"' Kconfig; then
             echo 'source "utils/Kconfig"' >> Kconfig
-          fi
-
-          DEFCONF_FILE="${DEFCONFIG_PATH}/${DEFCONFIG_NAME}"
-
-          # 打开 Docker 并关闭 ANDROID_PARANOID_NETWORK
-          if ! grep -q '^CONFIG_DOCKER=y' "${DEFCONF_FILE}"; then
-            echo "CONFIG_DOCKER=y" >> "${DEFCONF_FILE}"
-          fi
-          sed -i '/^CONFIG_ANDROID_PARANOID_NETWORK/d' "${DEFCONF_FILE}"
-          echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> "${DEFCONF_FILE}"
-
-          # 运行 runcpatch（兼容不同目录结构）
-          chmod +x utils/runcpatch.sh
-          [[ -f kernel/cgroup/cgroup.c ]] && sh utils/runcpatch.sh kernel/cgroup/cgroup.c || true
-          [[ -f kernel/cgroup.c ]] && sh utils/runcpatch.sh kernel/cgroup.c || true
-
-          # qtaguid 补丁（若存在源文件与补丁）
-          if [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]]; then
-            echo "应用 xt_qtaguid.patch"
-            patch -p0 < utils/xt_qtaguid.patch || true
+            echo "✓ 已在 Kconfig 引入 utils/Kconfig"
           else
-            echo "跳过 xt_qtaguid.patch（文件不存在）"
-          fi
-          echo "✅ LXC 补丁安装完成！"
-
-  compile_04b:
-    name: 04b · 编译（make）
-    runs-on: ubuntu-latest
-    needs: [fetch_02, derive_vars_03, prebuild_04a, prebuild_apply_lxc_04a2]
-    if: ${{ inputs.operation == 'cleanbuild' || inputs.operation == 'kernelonly' || inputs.operation == 'all' }}
-    outputs:
-      BUILD_DONE: ${{ steps.flag.outputs.BUILD_DONE }}
-    steps:
-      - name: Checkout workflow repo
-        uses: actions/checkout@v4
-      - name: Compile (strict make from build.sh)
-        id: compile
-        shell: bash
-        working-directory: ${{ needs.fetch_02.outputs.kernel_dir }}
-        env:
-          ARCH: arm64
-          CC: clang
-          LD: ld.lld
-          CLANG_TRIPLE: aarch64-linux-gnu-
-          CROSS_COMPILE: aarch64-linux-gnu-
-          CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
-          OUT: ../out
-          START_SEC: ${{ needs.derive_vars_03.outputs.START_SEC }}
-        run: |
-          set -euo pipefail
-          THREAD="$(nproc --all)"
-          CC_ADDITION_FLAGS="LD=${LD}"
-          echo "--- Building Kernel (make) ---"
-          make CC="$CC" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
-               CLANG_TRIPLE="$CLANG_TRIPLE" LLVM=1 LLVM_IAS=1 ${CC_ADDITION_FLAGS} O="$OUT" -j"${THREAD}"
-          END_SEC="$(date +%s)"
-          COST_SEC=$(( END_SEC - START_SEC ))
-          echo "⏱  Kernel Build Costed $((COST_SEC/60))min $((COST_SEC%60))s"
-      - name: Flag build done
-        id: flag
-        run: |
-          echo "BUILD_DONE=true" >> $GITHUB_OUTPUT
-      - name: Upload compile snapshot
-        uses: actions/upload-artifact@v4
-        with:
-          name: compile-out
-          path: |
-            out
-            ../out
-          if-no-files-found: ignore
-          retention-days: 3
-
-  link_dtb_04c:
-    name: 04c · Link DTB（拼接 dtb）
-    runs-on: ubuntu-latest
-    needs: [fetch_02, compile_04b]
-    if: ${{ inputs.operation == 'cleanbuild' || inputs.operation == 'all' }}
-    steps:
-      - name: Checkout workflow repo
-        uses: actions/checkout@v4
-      - name: Link all dtb files (strict from build.sh)
-        shell: bash
-        working-directory: ${{ needs.fetch_02.outputs.kernel_dir }}
-        env:
-          OUT: ../out
-        run: |
-          set -euo pipefail
-          echo "--- Linking DTB files ---"
-          find "$OUT/arch/arm64/boot/dts/vendor/qcom" -name '*.dtb' -exec cat {} + > "$OUT/arch/arm64/boot/dtb"
-
-  package_ak3_04d:
-    name: 04d · 打包 AnyKernel3 刷写包
-    runs-on: ubuntu-latest
-    needs: [fetch_02, derive_vars_03, prebuild_04a]
-    if: ${{ inputs.operation == 'cleanbuild' || inputs.operation == 'all' || inputs.operation == 'flashable' }}
-    outputs:
-      FLASH_ZIP_PATH: ${{ steps.pkg.outputs.FLASH_ZIP_PATH }}
-    steps:
-      - name: Checkout workflow repo
-        uses: actions/checkout@v4
-      - name: Package AK3 (strict from build.sh)
-        id: pkg
-        shell: bash
-        working-directory: ${{ needs.fetch_02.outputs.kernel_dir }}
-        env:
-          OUT: ../out
-          TARGET_KERNEL_FILE: arch/arm64/boot/Image
-          TARGET_KERNEL_DTB: arch/arm64/boot/dtb
-          TARGET_KERNEL_DTBO: arch/arm64/boot/dtbo.img
-          TARGET_KERNEL_NAME: Driftwood-Kernel
-          CURRENT_TIME: ${{ needs.derive_vars_03.outputs.CURRENT_TIME }}
-          TARGET_KERNEL_MOD_VERSION: ${{ needs.derive_vars_03.outputs.TARGET_KERNEL_MOD_VERSION }}
-        run: |
-          set -euo pipefail
-          echo "--- Generating AnyKernel3 package ---"
-          cd "$OUT" || { echo "❌ OUT 目录不存在，请先执行构建"; exit 1; }
-
-          DEVICE="${{ inputs.device_codename }}"
-          ANYKERNEL_URL="https://codeload.github.com/EndCredits/AnyKernel3/zip/refs/heads/${DEVICE}"
-          ANYKERNEL_PATH="AnyKernel3-${DEVICE}"
-          ANYKERNEL_FILE="anykernel.zip"
-
-          if [ ! -d "$ANYKERNEL_PATH" ]; then
-            echo "Fetching AnyKernel3: $ANYKERNEL_URL"
-            curl "$ANYKERNEL_URL" -o "$ANYKERNEL_FILE"
-            unzip -o "$ANYKERNEL_FILE"
-          else
-            echo "AnyKernel3 detected. Skip download."
+            echo "• Kconfig 已包含 utils/Kconfig"
           fi
 
-          echo "Cleaning old package files ..."
-          rm -rf "$ANYKERNEL_PATH/${TARGET_KERNEL_NAME}"*
-
-          echo "Copying kernel artifacts ..."
-          if [[ ! -f "$TARGET_KERNEL_FILE" ]]; then
-            echo "❌ 未找到 $TARGET_KERNEL_FILE，请确认已完成编译或已有历史构建"
+          # 修改 defconfig：启用 Docker，关闭 ANDROID_PARANOID_NETWORK
+          DEFCONFIG_FILE="$DEFCONFIG_PATH/$DEFCONFIG_NAME"
+          if [ ! -f "$DEFCONFIG_FILE" ]; then
+            echo "❌ 未找到 defconfig: $DEFCONFIG_FILE"
             exit 1
           fi
-          cp -r "$TARGET_KERNEL_FILE" "$ANYKERNEL_PATH/"
-          cp -r "$TARGET_KERNEL_DTB" "$ANYKERNEL_PATH/" || true
-          cp -r "$TARGET_KERNEL_DTBO" "$ANYKERNEL_PATH/" || true
 
-          echo "Zipping ..."
+          if ! grep -q '^CONFIG_DOCKER=y' "$DEFCONFIG_FILE"; then
+            echo "CONFIG_DOCKER=y" >> "$DEFCONFIG_FILE"
+            echo "✓ 已启用 CONFIG_DOCKER=y"
+          else
+            echo "• 已存在 CONFIG_DOCKER=y"
+          fi
+
+          sed -i '/CONFIG_ANDROID_PARANOID_NETWORK/d' "$DEFCONFIG_FILE"
+          echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> "$DEFCONFIG_FILE"
+          echo "✓ 已禁用 ANDROID_PARANOID_NETWORK"
+
+          # 应用 runcpatch（两种 cgroup 路径兼容）
+          chmod +x utils/runcpatch.sh
+          if [[ -f kernel/cgroup/cgroup.c ]]; then
+            sh utils/runcpatch.sh kernel/cgroup/cgroup.c || true
+            echo "✓ 已对 kernel/cgroup/cgroup.c 应用 runcpatch"
+          fi
+          if [[ -f kernel/cgroup.c ]]; then
+            sh utils/runcpatch.sh kernel/cgroup.c || true
+            echo "✓ 已对 kernel/cgroup.c 应用 runcpatch"
+          fi
+
+          # 应用 xt_qtaguid 补丁（若存在）
+          if [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]]; then
+            patch -p0 < utils/xt_qtaguid.patch || true
+            echo "✓ 已应用 xt_qtaguid.patch"
+          else
+            echo "• 跳过 xt_qtaguid.patch（文件不存在）"
+          fi
+
+          echo "✅ LXC 补丁安装完成！"
+
+      # ---------- clean 放在前面（仅 cleanbuild） ----------
+      - name: clean (for cleanbuild)
+        if: ${{ inputs.operation == 'cleanbuild' }}
+        shell: bash
+        working-directory: ${{ env.KERNEL_SRC_DIR }}
+        run: |
+          set -e
+          echo "Clean source tree and build files..."
+          make mrproper -j$(nproc --all) || true
+          make clean -j$(nproc --all) || true
+          rm -rf "$OUT" || true
+
+      # ---------- defconfig ----------
+      - name: make_defconfig
+        if: ${{ inputs.operation == 'all' || inputs.operation == 'cleanbuild' || inputs.operation == 'defconfig' || inputs.operation == 'kernelonly' }}
+        shell: bash
+        working-directory: ${{ env.KERNEL_SRC_DIR }}
+        run: |
+          set -e
+          echo "------------------------------"
+          echo " Building Kernel Defconfig.."
+          echo "------------------------------"
+
+          DEF_FRAG="$DEFCONFIG_NAME"
+          if [ "$WITH_KERNELSU" = "0" ]; then
+            DEF_FRAG="$DEF_FRAG $DISABLE_KSU_FRAGMENT"
+            echo "KernelSU disabled: using fragments -> $DEF_FRAG"
+          fi
+
+          mkdir -p "$OUT"
+          ccache -z || true
+          make CC="$CC" ARCH="$ARCH" \
+               CROSS_COMPILE="$CROSS_COMPILE" \
+               CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
+               CLANG_TRIPLE="$CLANG_TRIPLE" \
+               LLVM=1 LLVM_IAS=1 \
+               $CC_ADDITION_FLAGS \
+               O="$OUT" -j"$THREADS" \
+               $DEF_FRAG
+          ccache -s || true
+
+      # ---------- kernel ----------
+      - name: build_kernel
+        if: ${{ inputs.operation == 'all' || inputs.operation == 'cleanbuild' || inputs.operation == 'kernelonly' }}
+        shell: bash
+        working-directory: ${{ env.KERNEL_SRC_DIR }}
+        run: |
+          set -e
+          echo "------------------------------"
+          echo " Building Kernel ..........."
+          echo "------------------------------"
+
+          make CC="$CC" ARCH="$ARCH" \
+               CROSS_COMPILE="$CROSS_COMPILE" \
+               CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
+               CLANG_TRIPLE="$CLANG_TRIPLE" \
+               LLVM=1 LLVM_IAS=1 \
+               $CC_ADDITION_FLAGS \
+               O="$OUT" -j"$THREADS"
+          ccache -s || true
+
+          END_SEC=$(date +%s)
+          COST_SEC=$(( END_SEC-START_SEC ))
+          echo "Kernel Build Costed $((COST_SEC/60))min $((COST_SEC%60))s"
+
+      # ---------- link dtb ----------
+      - name: link_all_dtb_files
+        if: ${{ inputs.operation == 'all' || inputs.operation == 'cleanbuild' }}
+        shell: bash
+        working-directory: ${{ env.KERNEL_SRC_DIR }}
+        run: |
+          set -e
+          echo "------------------------------"
+          echo " Linking DTB files .........."
+          echo "------------------------------"
+
+          # 保持与原脚本一致：合并 vendor/qcom 下的所有 dtb 为一个文件
+          find "$OUT/arch/arm64/boot/dts/vendor/qcom" -name '*.dtb' -exec cat {} + > "$OUT/arch/arm64/boot/dtb"
+
+      # ---------- flashable ----------
+      - name: generate_flashable
+        if: ${{ inputs.operation == 'all' || inputs.operation == 'cleanbuild' || inputs.operation == 'flashable' }}
+        shell: bash
+        working-directory: ${{ env.KERNEL_SRC_DIR }}
+        run: |
+          set -e
+          echo "------------------------------"
+          echo " Generating Flashable Kernel"
+          echo "------------------------------"
+
+          cd "$OUT"
+
+          if [ ! -d "$ANYKERNEL_PATH" ]; then
+            echo " Getting AnyKernel "
+            curl -L "$ANYKERNEL_URL" -o "$ANYKERNEL_FILE"
+            unzip -o "$ANYKERNEL_FILE"
+          else
+            echo " AnyKernel3 Detected. Skipping download "
+          fi
+
+          echo " Removing old package files "
+          rm -rf "$ANYKERNEL_PATH/$TARGET_KERNEL_NAME"* || true
+
+          echo " Copying Kernel Files "
+          cp -r "$TARGET_KERNEL_FILE" "$ANYKERNEL_PATH"/
+          cp -r "$TARGET_KERNEL_DTB" "$ANYKERNEL_PATH"/
+          cp -r "$TARGET_KERNEL_DTBO" "$ANYKERNEL_PATH"/
+
+          echo " Packaging flashable Kernel "
           cd "$ANYKERNEL_PATH"
-          ZIP_NAME="${TARGET_KERNEL_NAME}-${CURRENT_TIME}-${TARGET_KERNEL_MOD_VERSION}.zip"
-          zip -q -r "${ZIP_NAME}" *
-          echo " Target File: $OUT/$ANYKERNEL_PATH/${ZIP_NAME}"
-          echo "FLASH_ZIP_PATH=$OUT/$ANYKERNEL_PATH/${ZIP_NAME}" >> $GITHUB_OUTPUT
-      - name: Upload AK3 package artifact
+          PKG_NAME="$TARGET_KERNEL_NAME-$CURRENT_TIME-$TARGET_KERNEL_MOD_VERSION.zip"
+          zip -q -r "$PKG_NAME" *
+
+          echo "PKG_NAME=$PKG_NAME" >> $GITHUB_ENV
+          echo "TARGET_PKG_PATH=$OUT/$ANYKERNEL_PATH/$PKG_NAME" >> $GITHUB_ENV
+
+          echo " Target File: $OUT/$ANYKERNEL_PATH/$PKG_NAME "
+
+      # ---------- savedefconfig ----------
+      - name: savedefconfig
+        if: ${{ inputs.operation == 'savedefconfig' }}
+        shell: bash
+        working-directory: ${{ env.KERNEL_SRC_DIR }}
+        run: |
+          set -e
+          echo "------------------------------"
+          echo " Saving kernel config ........"
+          echo "------------------------------"
+
+          mkdir -p "$OUT"
+          make CC="$CC" ARCH="$ARCH" \
+               CROSS_COMPILE="$CROSS_COMPILE" \
+               CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
+               CLANG_TRIPLE="$CLANG_TRIPLE" \
+               $CC_ADDITION_FLAGS \
+               O="$OUT" -j"$THREADS" savedefconfig
+
+          END_SEC=$(date +%s)
+          COST_SEC=$(( END_SEC-START_SEC ))
+          echo "Finished. Kernel config saved to $OUT/defconfig"
+          echo "Moving kernel defconfig to source tree"
+          mv "$OUT/defconfig" "$DEFCONFIG_PATH/$DEFCONFIG_NAME"
+          echo "Kernel Config Build Costed $((COST_SEC/60))min $((COST_SEC%60))s"
+
+      # ---------- version ----------
+      - name: version
+        if: ${{ inputs.operation == 'version' }}
+        shell: bash
+        working-directory: ${{ env.KERNEL_SRC_DIR }}
+        run: |
+          echo "Current version is: $LOCAL_VERSION_NUMBER"
+
+      # ---------- 上传 artifact ----------
+      - name: Upload flashable zip
+        if: ${{ inputs.operation == 'all' || inputs.operation == 'cleanbuild' || inputs.operation == 'flashable' }}
         uses: actions/upload-artifact@v4
         with:
-          name: flashable-kernel
-          path: ${{ steps.pkg.outputs.FLASH_ZIP_PATH }}
+          name: ${{ env.TARGET_KERNEL_NAME }}-${{ env.CURRENT_TIME }}-${{ env.TARGET_KERNEL_MOD_VERSION }}
+          path: ${{ env.TARGET_PKG_PATH }}
+          if-no-files-found: error
 
-  release_05:
-    name: 05 · 发布 Release
-    runs-on: ubuntu-latest
-    needs: [derive_vars_03, package_ak3_04d]
-    steps:
-      - name: Compose tag & name
-        id: meta
-        run: |
-          TAG="driftwood-${{ needs.derive_vars_03.outputs.CURRENT_TIME }}-${{ needs.derive_vars_03.outputs.TARGET_KERNEL_MOD_VERSION }}"
-          NAME="Driftwood Kernel ${{ inputs.device_codename }} ${{ needs.derive_vars_03.outputs.CURRENT_TIME }}"
-          echo "TAG_NAME=${TAG}" >> $GITHUB_ENV
-          echo "RELEASE_NAME=${NAME}" >> $GITHUB_ENV
-      - name: Create GitHub Release & upload asset
+      # ---------- 发布到 Release（仅在 tag 推送） ----------
+      - name: Publish Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/') && (inputs.operation == 'all' || inputs.operation == 'cleanbuild' || inputs.operation == 'flashable')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.TAG_NAME }}
-          name: ${{ env.RELEASE_NAME }}
-          body: |
-            Operation: `${{ inputs.operation }}`  
-            Device: `${{ inputs.device_codename }}`  
-            Kernel repo: `${{ inputs.kernel_repo_url }}`  
-            Defconfig: `${{ inputs.defconfig_path }}`  
-            Local version: `${{ needs.derive_vars_03.outputs.LOCAL_VERSION_NUMBER }}`  
-            Kernel mod version: `${{ needs.derive_vars_03.outputs.TARGET_KERNEL_MOD_VERSION }}`  
-          files: ${{ needs.package_ak3_04d.outputs.FLASH_ZIP_PATH }}
-          draft: "false"
-          prerelease: "false"
+          files: ${{ env.TARGET_PKG_PATH }}
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  summary_06:
-    name: 06 · 汇总
-    runs-on: ubuntu-latest
-    needs: [prep_01, fetch_02, derive_vars_03, prebuild_04a, prebuild_apply_lxc_04a2, compile_04b, link_dtb_04c, package_ak3_04d, release_05]
-    steps:
-      - name: Final summary
-        run: |
-          echo "✅ 完成。"
-          echo "Operation=${{ inputs.operation }} | noksu=${{ inputs.noksu }}"
-          echo "Kernel repo=${{ inputs.kernel_repo_url }}"
-          echo "Device=${{ inputs.device_codename }}"
-          echo "Defconfig=${{ inputs.defconfig_path }}"
-          echo "Version=${{ needs.derive_vars_03.outputs.LOCAL_VERSION_NUMBER }}"
-          echo "ModVersion=${{ needs.derive_vars_03.outputs.TARGET_KERNEL_MOD_VERSION }}"
