@@ -1,285 +1,442 @@
 
-name: Build Native-like ROM Kernel (Shell-logic) + LXC + AnyKernel3 + Release
+name: Rosemary Kernel Build (segmented + LXC patch, strict from build.sh)
 
 on:
   workflow_dispatch:
     inputs:
       kernel_repo_url:
-        description: "内核源码仓库地址（例如：https://github.com/august-aosp/android_kernel_xiaomi_sm7250）"
+        description: "内核源码仓库地址（例如 https://github.com/YourOrg/your-kernel.git ）"
         required: true
-        default: "https://github.com/august-aosp/android_kernel_xiaomi_sm7250"
         type: string
       device_codename:
-        description: "机型代号（例如：picasso、beryllium 等）"
+        description: "机型代号（用于 AnyKernel3 分支与目录名，例如 picasso）"
         required: true
-        default: "picasso"
         type: string
       defconfig_path:
-        description: "defconfig 路径或文件名（如：vendor/picasso_defconfig 或 arch/arm64/configs/vendor/picasso_defconfig）"
+        description: "完整的 defconfig 路径（例如 arch/arm64/configs/vendor/picasso_user_defconfig）"
         required: true
-        default: "vendor/picasso_defconfig"
         type: string
-
-permissions:
-  contents: write
+      operation:
+        description: "build.sh 操作：all | cleanbuild | flashable | kernelonly | defconfig | savedefconfig | version"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - cleanbuild
+          - flashable
+          - kernelonly
+          - defconfig
+          - savedefconfig
+          - version
+      noksu:
+        description: "不启用 KernelSU（仅对 all/defconfig 生效；等价于传入 'noksu'）"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
-  build-and-release:
+  01-prepare:
+    name: 01 · 准备环境与工具链
     runs-on: ubuntu-latest
-    env:
-      TZ: Asia/Shanghai
-
     steps:
-      - name: Checkout current repo
+      - name: Checkout workflow repo
         uses: actions/checkout@v4
-
-      - name: Show inputs
-        shell: bash
+      - name: Install toolchain & utilities
         run: |
-          echo "kernel_repo_url=${{ inputs.kernel_repo_url }}"
-          echo "device_codename=${{ inputs.device_codename }}"
-          echo "defconfig_path=${{ inputs.defconfig_path }}"
-
-      # 仅安装基础依赖（不做任何 LLVM 版本映射/替换；遵循 sh 脚本“PATH 有 clang 即可”的思路）
-      - name: Install minimal build dependencies (clang, lld, etc.)
-        shell: bash
-        run: |
-          set -eux
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison flex \
-            build-essential git curl wget zip unzip patch \
-            libssl-dev libelf-dev \
-            python3 rsync ccache \
-            dwarves lz4 clang lld \
-            binutils-aarch64-linux-gnu
+            build-essential \
+            clang llvm lld \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi g++-arm-linux-gnueabi \
+            bc curl unzip zip git patch
+          echo "PATH=/usr/bin:${PATH}" >> $GITHUB_ENV
 
+  02-fetch-kernel:
+    name: 02 · 拉取内核源码与输入校验
+    runs-on: ubuntu-latest
+    needs: [01-prepare]
+    outputs:
+      kernel_dir: ${{ steps.outvars.outputs.kernel_dir }}
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
       - name: Clone kernel source
-        shell: bash
-        run: |
-          set -eux
-          git clone --depth=1 "${{ inputs.kernel_repo_url }}" kernel-src
-
-      - name: Init submodules (if any)
-        working-directory: kernel-src
-        shell: bash
-        run: |
-          set -eux
-          git submodule update --init --recursive || true
-
-      # 解析 defconfig 路径（支持 vendor 子目录）；仅用于补丁注入时定位目标文件
-      - name: Resolve defconfig path
-        id: defcfg
-        working-directory: kernel-src
-        shell: bash
-        env:
-          ARCH_IN: "arm64"
-        run: |
-          set -eux
-          DF_IN="${{ inputs.defconfig_path }}"
-          if [ -f "$DF_IN" ]; then
-            DF_PATH="$DF_IN"
-          else
-            CANDIDATES=(
-              "arch/${ARCH_IN}/configs/${DF_IN}"
-              "arch/${ARCH_IN}/configs/$(basename "$DF_IN")"
-              "arch/${ARCH_IN}/configs/vendor/$(basename "$DF_IN")"
-              "vendor/$(basename "$DF_IN")"
-              "${DF_IN}"
-            )
-            DF_PATH=""
-            for p in "${CANDIDATES[@]}"; do
-              if [ -f "$p" ]; then DF_PATH="$p"; break; fi
-            done
-            if [ -z "$DF_PATH" ]; then
-              echo "❌ 未找到 defconfig 文件，尝试过以下："
-              printf ' - %s\n' "${CANDIDATES[@]}"
-              exit 1
-            fi
-          fi
-          echo "DF_PATH=${DF_PATH}" >> "$GITHUB_OUTPUT"
-          echo "✔ defconfig：$DF_PATH"
-
-      #####################################################################
-      # 编译前打 LXC 补丁（严格遵循 sh 逻辑：纯 bash 操作源码 + 改 defconfig）
-      #####################################################################
-      - name: Fetch LXC utils
-        working-directory: kernel-src
-        shell: bash
-        run: |
-          set -eux
-          mkdir -p Patchs
-          wget -O Patchs/LXC_utils.zip \
-            "https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/Patchs/LXC_utils.zip"
-          ls -l Patchs/LXC_utils.zip
-
-      - name: Apply LXC patches (Docker, runcpatch, xt_qtaguid)
-        working-directory: kernel-src
-        shell: bash
-        env:
-          DF_PATH: ${{ steps.defcfg.outputs.DF_PATH }}
+        id: outvars
         run: |
           set -euo pipefail
-          echo "🔧 应用 LXC 相关改动..."
-          rm -rf utils && unzip -o Patchs/LXC_utils.zip -d utils
+          git clone --depth=1 "${{ inputs.kernel_repo_url }}" kernel
+          echo "kernel_dir=${GITHUB_WORKSPACE}/kernel" >> $GITHUB_OUTPUT
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          DEFCONFIG_FULL="${{ inputs.defconfig_path }}"
+          if [[ ! "${DEFCONFIG_FULL}" =~ ^arch/arm64/configs/.+ ]]; then
+            echo "❌ defconfig_path 不在 arch/arm64/configs 下：${DEFCONFIG_FULL}"
+            exit 1
+          fi
+          CODENAME="${{ inputs.device_codename }}"
+          if [[ -z "${CODENAME}" ]]; then
+            echo "❌ device_codename 不能为空"
+            exit 1
+          fi
+          echo "✅ 输入校验通过：defconfig=${DEFCONFIG_FULL}，codename=${CODENAME}"
 
-          # 在顶层 Kconfig 加入 utils/Kconfig
+  03-derive-vars:
+    name: 03 · 计算派生变量（THREAD/版本等）
+    runs-on: ubuntu-latest
+    needs: [02-fetch-kernel]
+    outputs:
+      DEFCONFIG_PATH: ${{ steps.vars.outputs.DEFCONFIG_PATH }}
+      DEFCONFIG_NAME: ${{ steps.vars.outputs.DEFCONFIG_NAME }}
+      LOCAL_VERSION_NUMBER: ${{ steps.vars.outputs.LOCAL_VERSION_NUMBER }}
+      TARGET_KERNEL_MOD_VERSION: ${{ steps.vars.outputs.TARGET_KERNEL_MOD_VERSION }}
+      CURRENT_TIME: ${{ steps.vars.outputs.CURRENT_TIME }}
+      START_SEC: ${{ steps.vars.outputs.START_SEC }}
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+      - name: Derive variables (strict from build.sh)
+        id: vars
+        working-directory: ${{ needs.02-fetch-kernel.outputs.kernel_dir }}
+        run: |
+          set -euo pipefail
+          echo "THREAD=$(nproc --all)" >> $GITHUB_ENV
+
+          DEFCONFIG_FULL="${{ inputs.defconfig_path }}"
+          DEFCONFIG_PATH="$(dirname "${DEFCONFIG_FULL}")"
+          DEFCONFIG_NAME="$(basename "${DEFCONFIG_FULL}")"
+
+          LOCAL_VERSION_NUMBER="$(cat "${DEFCONFIG_PATH}/${DEFCONFIG_NAME}" \
+            | grep CONFIG_LOCALVERSION= \
+            | cut -d '=' -f 2 \
+            | sed 's/"//g' \
+            | sed 's/-Driftwood-//g')"
+
+          TARGET_KERNEL_MOD_VERSION="$(make kernelversion)-${LOCAL_VERSION_NUMBER}"
+          CURRENT_TIME="$(date '+%Y-%m%d%H%M')"
+          START_SEC="$(date +%s)"
+
+          echo "DEFCONFIG_PATH=${DEFCONFIG_PATH}" >> $GITHUB_OUTPUT
+          echo "DEFCONFIG_NAME=${DEFCONFIG_NAME}" >> $GITHUB_OUTPUT
+          echo "LOCAL_VERSION_NUMBER=${LOCAL_VERSION_NUMBER}" >> $GITHUB_OUTPUT
+          echo "TARGET_KERNEL_MOD_VERSION=${TARGET_KERNEL_MOD_VERSION}" >> $GITHUB_OUTPUT
+          echo "CURRENT_TIME=${CURRENT_TIME}" >> $GITHUB_OUTPUT
+          echo "START_SEC=${START_SEC}" >> $GITHUB_OUTPUT
+
+  04a-pre-build:
+    name: 04a · 编译前（clean + defconfig）
+    runs-on: ubuntu-latest
+    needs: [02-fetch-kernel, 03-derive-vars]
+    if: ${{ inputs.operation != 'version' && inputs.operation != 'savedefconfig' }}
+    outputs:
+      OUT_DIR: ${{ steps.outpath.outputs.OUT_DIR }}
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Pre-Build steps (strictly mirror build.sh)
+        id: pre
+        shell: bash
+        working-directory: ${{ needs.02-fetch-kernel.outputs.kernel_dir }}
+        env:
+          ARCH: arm64
+          CC: clang
+          LD: ld.lld
+          CLANG_TRIPLE: aarch64-linux-gnu-
+          CROSS_COMPILE: aarch64-linux-gnu-
+          CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
+          OUT: ../out
+          DISABLE_KSU_FRAGMENT: vendor/disable_ksu.config
+          DEFCONFIG_PATH: ${{ needs.03-derive-vars.outputs.DEFCONFIG_PATH }}
+          DEFCONFIG_NAME: ${{ needs.03-derive-vars.outputs.DEFCONFIG_NAME }}
+        run: |
+          set -euo pipefail
+          THREAD="$(nproc --all)"
+          CC_ADDITION_FLAGS="LD=${LD}"
+          WITH_KERNELSU=1
+          [[ "${{ inputs.noksu }}" == "true" ]] && WITH_KERNELSU=0
+
+          clean() {
+            echo "--- Cleaning source tree & out ---"
+            make mrproper -j"${THREAD}"
+            make clean -j"${THREAD}"
+            rm -rf "${OUT}"
+          }
+
+          make_defconfig() {
+            echo "--- Building Defconfig ---"
+            DEFCONF_NAME="${DEFCONFIG_NAME}"
+            if [[ "${WITH_KERNELSU}" == "0" ]]; then
+              DEFCONF_NAME="${DEFCONF_NAME} ${DISABLE_KSU_FRAGMENT}"
+            fi
+            make CC="$CC" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
+                 CLANG_TRIPLE="$CLANG_TRIPLE" LLVM=1 LLVM_IAS=1 ${CC_ADDITION_FLAGS} O="$OUT" -j"${THREAD}" ${DEFCONF_NAME}
+          }
+
+          op="${{ inputs.operation }}"
+          if [[ "${op}" == "cleanbuild" ]]; then
+            clean
+            make_defconfig
+          elif [[ "${op}" == "kernelonly" || "${op}" == "all" || "${op}" == "defconfig" ]]; then
+            make_defconfig
+          elif [[ "${op}" == "flashable" ]]; then
+            echo "flashable: 不执行 defconfig（与脚本一致：需已有构建）"
+          else
+            echo "version/savedefconfig 在其他阶段处理，这里不运行。"
+          fi
+
+      - name: OUT dir path
+        id: outpath
+        run: |
+          echo "OUT_DIR=out" >> $GITHUB_OUTPUT
+          echo "OUT_DIR_UP=../out" >> $GITHUB_OUTPUT
+
+      - name: Upload pre-build snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre-build-out
+          path: |
+            out
+            ../out
+          if-no-files-found: ignore
+          retention-days: 3
+
+  04a2-apply-lxc:
+    name: 04a2 · 编译前打 LXC 补丁（Docker/qtaguid/runcpatch）
+    runs-on: ubuntu-latest
+    needs: [02-fetch-kernel, 03-derive-vars, 04a-pre-build]
+    # 仅在会进行编译的操作下执行
+    if: ${{ inputs.operation == 'cleanbuild' || inputs.operation == 'kernelonly' || inputs.operation == 'all' }}
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Apply LXC patches (enable Docker, qtaguid, runcpatch)
+        shell: bash
+        working-directory: ${{ needs.02-fetch-kernel.outputs.kernel_dir }}
+        env:
+          DEFCONFIG_PATH: ${{ needs.03-derive-vars.outputs.DEFCONFIG_PATH }}
+          DEFCONFIG_NAME: ${{ needs.03-derive-vars.outputs.DEFCONFIG_NAME }}
+        run: |
+          set -euo pipefail
+          echo "🔧 正在为内核安装 LXC 补丁..."
+
+          # 优先使用仓库内 Patchs/LXC_utils.zip；若不存在则从远程下载
+          if [[ -f "Patchs/LXC_utils.zip" ]]; then
+            echo "使用仓库内 Patchs/LXC_utils.zip"
+            rm -rf utils && unzip -o "Patchs/LXC_utils.zip" -d utils
+          else
+            echo "从远程下载 LXC_utils.zip"
+            curl -L "https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/Patchs/LXC_utils.zip" -o LXC_utils.zip
+            rm -rf utils && unzip -o LXC_utils.zip -d utils
+          fi
+
+          # 确保 utils 目录包含必要文件
+          test -f utils/Kconfig || { echo "❌ utils/Kconfig 缺失"; ls -la utils || true; exit 1; }
+          test -f utils/runcpatch.sh || { echo "❌ utils/runcpatch.sh 缺失"; ls -la utils || true; exit 1; }
+
+          # 在根 Kconfig 引入 utils/Kconfig
           if ! grep -q 'source "utils/Kconfig"' Kconfig; then
             echo 'source "utils/Kconfig"' >> Kconfig
           fi
 
-          # 修改 defconfig：启用 Docker，关闭 ANDROID_PARANOID_NETWORK
-          if [ -f "$DF_PATH" ]; then
-            if ! grep -q '^CONFIG_DOCKER=y' "$DF_PATH"; then
-              echo "CONFIG_DOCKER=y" >> "$DF_PATH"
-            fi
-            sed -i '/CONFIG_ANDROID_PARANOID_NETWORK/d' "$DF_PATH" || true
-            echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> "$DF_PATH"
-          fi
+          DEFCONF_FILE="${DEFCONFIG_PATH}/${DEFCONFIG_NAME}"
 
-          # runcpatch：两条常见路径都尝试
+          # 打开 Docker 并关闭 ANDROID_PARANOID_NETWORK
+          if ! grep -q '^CONFIG_DOCKER=y' "${DEFCONF_FILE}"; then
+            echo "CONFIG_DOCKER=y" >> "${DEFCONF_FILE}"
+          fi
+          # 移除旧项，追加 not set
+          sed -i '/^CONFIG_ANDROID_PARANOID_NETWORK/d' "${DEFCONF_FILE}"
+          echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> "${DEFCONF_FILE}"
+
+          # 运行 runcpatch（兼容不同内核目录结构）
           chmod +x utils/runcpatch.sh
-          [ -f kernel/cgroup/cgroup.c ] && sh utils/runcpatch.sh kernel/cgroup/cgroup.c || true
-          [ -f kernel/cgroup.c ]       && sh utils/runcpatch.sh kernel/cgroup.c       || true
+          [[ -f kernel/cgroup/cgroup.c ]] && sh utils/runcpatch.sh kernel/cgroup/cgroup.c || true
+          [[ -f kernel/cgroup.c ]] && sh utils/runcpatch.sh kernel/cgroup.c || true
 
-          # xt_qtaguid 补丁（存在则应用；失败不致命）
-          if [ -f net/netfilter/xt_qtaguid.c ] && [ -f utils/xt_qtaguid.patch ]; then
+          # qtaguid 补丁（若存在源文件与补丁）
+          if [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]]; then
+            echo "应用 xt_qtaguid.patch"
             patch -p0 < utils/xt_qtaguid.patch || true
+          else
+            echo "跳过 xt_qtaguid.patch（文件不存在）"
           fi
-          echo "✅ LXC 补丁完成"
+          echo "✅ LXC 补丁安装完成！"
 
-      #####################################################################
-      # 纯 sh 脚本逻辑：make_defconfig → build_kernel → link_all_dtb → 打包
-      #####################################################################
-      - name: Build kernel via Shell-logic
-        working-directory: kernel-src
+  04b-compile:
+    name: 04b · 编译（make）
+    runs-on: ubuntu-latest
+    needs: [02-fetch-kernel, 03-derive-vars, 04a-pre-build, 04a2-apply-lxc]
+    if: ${{ inputs.operation == 'cleanbuild' || inputs.operation == 'kernelonly' || inputs.operation == 'all' }}
+    outputs:
+      BUILD_DONE: ${{ steps.flag.outputs.BUILD_DONE }}
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+      - name: Compile (strict make from build.sh)
+        id: compile
         shell: bash
+        working-directory: ${{ needs.02-fetch-kernel.outputs.kernel_dir }}
         env:
-          DEFCONFIG_NAME: ${{ inputs.defconfig_path }}
+          ARCH: arm64
+          CC: clang
+          LD: ld.lld
+          CLANG_TRIPLE: aarch64-linux-gnu-
+          CROSS_COMPILE: aarch64-linux-gnu-
+          CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
+          OUT: ../out
+          START_SEC: ${{ needs.03-derive-vars.outputs.START_SEC }}
         run: |
-          set -eux
+          set -euo pipefail
+          THREAD="$(nproc --all)"
+          CC_ADDITION_FLAGS="LD=${LD}"
+          echo "--- Building Kernel (make) ---"
+          make CC="$CC" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
+               CLANG_TRIPLE="$CLANG_TRIPLE" LLVM=1 LLVM_IAS=1 ${CC_ADDITION_FLAGS} O="$OUT" -j"${THREAD}"
+          END_SEC="$(date +%s)"
+          COST_SEC=$(( END_SEC - START_SEC ))
+          echo "⏱  Kernel Build Costed $((COST_SEC/60))min $((COST_SEC%60))s"
+      - name: Flag build done
+        id: flag
+        run: |
+          echo "BUILD_DONE=true" >> $GITHUB_OUTPUT
+      - name: Upload compile snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: compile-out
+          path: |
+            out
+            ../out
+          if-no-files-found: ignore
+          retention-days: 3
 
-          # ===== 变量（完全遵循 sh 脚本） =====
-          ARCH=arm64
-          CC=clang
-          LD=ld.lld
-          CLANG_TRIPLE=aarch64-linux-gnu-
-          CROSS_COMPILE=aarch64-linux-gnu-
-          CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-          THREAD=$(nproc --all)
-          OUT="../out"
+  04c-link-dtb:
+    name: 04c · Link DTB（拼接 dtb）
+    runs-on: ubuntu-latest
+    needs: [02-fetch-kernel, 04b-compile]
+    if: ${{ inputs.operation == 'cleanbuild' || inputs.operation == 'all' }}
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+      - name: Link all dtb files (strict from build.sh)
+        shell: bash
+        working-directory: ${{ needs.02-fetch-kernel.outputs.kernel_dir }}
+        env:
+          OUT: ../out
+        run: |
+          set -euo pipefail
+          echo "--- Linking DTB files ---"
+          find "$OUT/arch/arm64/boot/dts/vendor/qcom" -name '*.dtb' -exec cat {} + > "$OUT/arch/arm64/boot/dtb"
 
-          # ===== defconfig（纯 sh 逻辑） =====
-          echo ">>> Building defconfig ($DEFCONFIG_NAME)"
-          make CC=$CC ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_COMPAT=$CROSS_COMPILE_COMPAT \
-               CLANG_TRIPLE=$CLANG_TRIPLE LLVM=1 LLVM_IAS=1 LD=$LD O=$OUT -j$THREAD "$DEFCONFIG_NAME"
+  04d-package-ak3:
+    name: 04d · 打包 AnyKernel3 刷写包
+    runs-on: ubuntu-latest
+    needs: [02-fetch-kernel, 03-derive-vars, 04a-pre-build]
+    if: ${{ inputs.operation == 'cleanbuild' || inputs.operation == 'all' || inputs.operation == 'flashable' }}
+    outputs:
+      FLASH_ZIP_PATH: ${{ steps.pkg.outputs.FLASH_ZIP_PATH }}
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+      - name: Package AK3 (strict from build.sh)
+        id: pkg
+        shell: bash
+        working-directory: ${{ needs.02-fetch-kernel.outputs.kernel_dir }}
+        env:
+          OUT: ../out
+          TARGET_KERNEL_FILE: arch/arm64/boot/Image
+          TARGET_KERNEL_DTB: arch/arm64/boot/dtb
+          TARGET_KERNEL_DTBO: arch/arm64/boot/dtbo.img
+          TARGET_KERNEL_NAME: Driftwood-Kernel
+          CURRENT_TIME: ${{ needs.03-derive-vars.outputs.CURRENT_TIME }}
+          TARGET_KERNEL_MOD_VERSION: ${{ needs.03-derive-vars.outputs.TARGET_KERNEL_MOD_VERSION }}
+        run: |
+          set -euo pipefail
+          echo "--- Generating AnyKernel3 package ---"
+          cd "$OUT" || { echo "❌ OUT 目录不存在，请先执行构建"; exit 1; }
 
-          # ===== 编译（纯 sh 逻辑） =====
-          echo ">>> Building kernel"
-          make CC=$CC ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_COMPAT=$CROSS_COMPILE_COMPAT \
-               CLANG_TRIPLE=$CLANG_TRIPLE LLVM=1 LLVM_IAS=1 LD=$LD O=$OUT -j$THREAD
+          DEVICE="${{ inputs.device_codename }}"
+          ANYKERNEL_URL="https://codeload.github.com/EndCredits/AnyKernel3/zip/refs/heads/${DEVICE}"
+          ANYKERNEL_PATH="AnyKernel3-${DEVICE}"
+          ANYKERNEL_FILE="anykernel.zip"
 
-          # ===== 链接所有 dtb（纯 sh 逻辑） =====
-          echo ">>> Linking all DTB files"
-          if [ -d "$OUT/arch/arm64/boot/dts" ]; then
-            # 常见路径（厂商树可能不同），这里以 vendor/qcom 为例并提供兜底
-            if [ -d "$OUT/arch/arm64/boot/dts/vendor/qcom" ]; then
-              find "$OUT/arch/arm64/boot/dts/vendor/qcom" -name '*.dtb' -exec cat {} + > "$OUT/arch/arm64/boot/dtb"
-            else
-              # 兜底：收集所有 dtb
-              find "$OUT/arch/arm64/boot/dts" -name '*.dtb' -exec cat {} + > "$OUT/arch/arm64/boot/dtb" || true
-            fi
+          if [ ! -d "$ANYKERNEL_PATH" ]; then
+            echo "Fetching AnyKernel3: $ANYKERNEL_URL"
+            curl "$ANYKERNEL_URL" -o "$ANYKERNEL_FILE"
+            unzip -o "$ANYKERNEL_FILE"
+          else
+            echo "AnyKernel3 detected. Skip download."
           fi
 
-      # 查找 Image/dtb/dtbo（用于 AnyKernel3 打包）
-      - name: Locate kernel images
-        id: locateimg
-        shell: bash
-        run: |
-          set -eux
-          ARCH_DIR="out/arch/arm64/boot"
-          KIMG=$(ls ${ARCH_DIR}/Image*.lz4-dtb ${ARCH_DIR}/Image*.gz-dtb ${ARCH_DIR}/Image*-dtb ${ARCH_DIR}/Image.gz ${ARCH_DIR}/Image 2>/dev/null | head -n 1 || true)
-          if [ -z "$KIMG" ]; then
-            echo "No kernel image found under ${ARCH_DIR}" >&2
+          echo "Cleaning old package files ..."
+          rm -rf "$ANYKERNEL_PATH/${TARGET_KERNEL_NAME}"*
+
+          echo "Copying kernel artifacts ..."
+          if [[ ! -f "$TARGET_KERNEL_FILE" ]]; then
+            echo "❌ 未找到 $TARGET_KERNEL_FILE，请确认已完成编译或已有历史构建"
             exit 1
           fi
-          DTB=$(ls ${ARCH_DIR}/dtb 2>/dev/null || true)
-          DTBO=$(ls ${ARCH_DIR}/dtbo.img 2>/dev/null || true)
-          echo "KIMG=$KIMG"  >> $GITHUB_OUTPUT
-          echo "DTB=$DTB"    >> $GITHUB_OUTPUT
-          echo "DTBO=$DTBO"  >> $GITHUB_OUTPUT
-          echo "Found kernel image: $KIMG"
-          [ -n "$DTB" ]  && echo "Found dtb: $DTB"
-          [ -n "$DTBO" ] && echo "Found dtbo: $DTBO"
+          cp -r "$TARGET_KERNEL_FILE" "$ANYKERNEL_PATH/"
+          cp -r "$TARGET_KERNEL_DTB" "$ANYKERNEL_PATH/" || true
+          cp -r "$TARGET_KERNEL_DTBO" "$ANYKERNEL_PATH/" || true
 
-      #####################################################################
-      # AnyKernel3 打包（遵循 sh 思路：把 Image、dtb、dtbo 填到 AK3）
-      #####################################################################
-      - name: Clone AnyKernel3
-        shell: bash
+          echo "Zipping ..."
+          cd "$ANYKERNEL_PATH"
+          ZIP_NAME="${TARGET_KERNEL_NAME}-${CURRENT_TIME}-${TARGET_KERNEL_MOD_VERSION}.zip"
+          zip -q -r "${ZIP_NAME}" *
+          echo " Target File: $OUT/$ANYKERNEL_PATH/${ZIP_NAME}"
+          echo "FLASH_ZIP_PATH=$OUT/$ANYKERNEL_PATH/${ZIP_NAME}" >> $GITHUB_OUTPUT
+      - name: Upload AK3 package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashable-kernel
+          path: ${{ steps.pkg.outputs.FLASH_ZIP_PATH }}
+
+  05-package-release:
+    name: 05 · 发布 Release
+    runs-on: ubuntu-latest
+    needs: [03-derive-vars, 04d-package-ak3]
+    steps:
+      - name: Compose tag & name
+        id: meta
         run: |
-          set -eux
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
-
-      - name: Prepare AnyKernel3 payload
-        shell: bash
-        run: |
-          set -eux
-          cp "${{ steps.locateimg.outputs.KIMG }}" AnyKernel3/
-          if [ -n "${{ steps.locateimg.outputs.DTB }}" ];  then cp "${{ steps.locateimg.outputs.DTB }}"  AnyKernel3/; fi
-          if [ -n "${{ steps.locateimg.outputs.DTBO }}" ]; then cp "${{ steps.locateimg.outputs.DTBO }}" AnyKernel3/; fi
-
-          # 若存在 modules，则一并打入
-          if [ -d "out/lib/modules" ]; then
-            mkdir -p AnyKernel3/modules
-            rsync -a "out/lib/modules/" AnyKernel3/modules/ || true
-          fi
-
-      - name: Patch anykernel.sh (device tag)
-        working-directory: AnyKernel3
-        shell: bash
-        run: |
-          set -eux
-          if grep -q '^device.name1=' anykernel.sh; then
-            sed -i "s|^device.name1=.*|device.name1=${{ inputs.device_codename }}|" anykernel.sh
-          else
-            sed -i "1idevice.name1=${{ inputs.device_codename }}" anykernel.sh
-          fi
-          if grep -q '^kernel.string=' anykernel.sh; then
-            sed -i "s|^kernel.string=.*|kernel.string=Kernel for ${{ inputs.device_codename }} (clang+lld)|" anykernel.sh
-          else
-            sed -i "1ikernel.string=Kernel for ${{ inputs.device_codename }} (clang+lld)" anykernel.sh
-          fi
-
-      - name: Make flashable ZIP
-        id: makezip
-        working-directory: AnyKernel3
-        shell: bash
-        run: |
-          set -eux
-          DATESTR="$(date +%Y%m%d-%H%M)"
-          ZIPNAME="AK3-${{ inputs.device_codename }}-${DATESTR}.zip"
-          zip -r9 "../${ZIPNAME}" .
-          echo "ZIPPATH=${ZIPNAME}" >> $GITHUB_OUTPUT
-          echo "DATESTR=${DATESTR}" >> $GITHUB_OUTPUT
-          echo "Flashable zip: ${ZIPNAME}"
-
-      - name: Create Release and upload assets
+          TAG="driftwood-${{ needs.03-derive-vars.outputs.CURRENT_TIME }}-${{ needs.03-derive-vars.outputs.TARGET_KERNEL_MOD_VERSION }}"
+          NAME="Driftwood Kernel ${{ inputs.device_codename }} ${{ needs.03-derive-vars.outputs.CURRENT_TIME }}"
+          echo "TAG_NAME=${TAG}" >> $GITHUB_ENV
+          echo "RELEASE_NAME=${NAME}" >> $GITHUB_ENV
+      - name: Create GitHub Release & upload asset
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ format('ak3-{0}-{1}', inputs.device_codename, steps.makezip.outputs.DATESTR) }}
-          name: "AnyKernel3 for ${{ inputs.device_codename }} (clang+lld)"
+          tag_name: ${{ env.TAG_NAME }}
+          name: ${{ env.RELEASE_NAME }}
           body: |
-            - Device: ${{ inputs.device_codename }}
-            - Kernel repo: ${{ inputs.kernel_repo_url }}
-            - Defconfig: ${{ inputs.defconfig_path }}
-            - Arch: arm64
-            - Toolchain: clang + lld (LLVM_IAS=1)
-            - LXC patches: Docker enabled, runcpatch applied, xt_qtaguid patched (if present)
-            - Built at: ${{ env.TZ }}
+            Operation: `${{ inputs.operation }}`  
+            Device: `${{ inputs.device_codename }}`  
+            Kernel repo: `${{ inputs.kernel_repo_url }}`  
+            Defconfig: `${{ inputs.defconfig_path }}`  
+            Local version: `${{ needs.03-derive-vars.outputs.LOCAL_VERSION_NUMBER }}`  
+            Kernel mod version: `${{ needs.03-derive-vars.outputs.TARGET_KERNEL_MOD_VERSION }}`  
+          files: |
+            ${{ needs.04d-package-ak3.outputs.FLASH_ZIP_PATH }}
           draft: false
           prerelease: false
-          files: |
-            ${{ steps.makezip.outputs.ZIPPATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  06-summary:
+    name: 06 · 汇总
+    runs-on: ubuntu-latest
+    needs: [01-prepare, 02-fetch-kernel, 03-derive-vars, 04a-pre-build, 04a2-apply-lxc, 04b-compile, 04c-link-dtb, 04d-package-ak3, 05-package-release]
+    steps:
+      - name: Final summary
+        run: |
+          echo "✅ 完成。"
+          echo "Operation=${{ inputs.operation }} | noksu=${{ inputs.noksu }}"
+          echo "Kernel repo=${{ inputs.kernel_repo_url }}"
+          echo "Device=${{ inputs.device_codename }}"
+          echo "Defconfig=${{ inputs.defconfig_path }}"
+          echo "Version=${{ needs.03-derive-vars.outputs.LOCAL_VERSION_NUMBER }}"
+          echo "ModVersion=${{ needs.03-derive-vars.outputs.TARGET_KERNEL_MOD_VERSION }}"
