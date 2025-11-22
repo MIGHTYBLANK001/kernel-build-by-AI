@@ -63,28 +63,22 @@ jobs:
       - name: Checkout current repo
         uses: actions/checkout@v5
 
-      #####################################################################
-      # 在所有主要命令开始前：创建 10G 工作空间（loopback ext4），并供 O= 使用
-      #####################################################################
+      # 10G 工作空间（最前创建）
       - name: Prepare 10G build workspace (loopback ext4)
         id: ws
         shell: bash
         run: |
           set -eux
-          # 若工具不存在则安装（避免 mkfs.ext4/mount 缺失）
           if ! command -v mkfs.ext4 >/dev/null 2>&1 || ! command -v mount >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y e2fsprogs util-linux
           fi
-
           sudo mkdir -p /mnt/workspace
-          # 创建 10G 稀疏镜像文件并格式化为 ext4
           sudo dd if=/dev/zero of=/mnt/workspace.img bs=1M count=0 seek=10240
           sudo mkfs.ext4 -F /mnt/workspace.img
           sudo mount -o loop /mnt/workspace.img /mnt/workspace
           sudo chown $USER:$USER /mnt/workspace
           mkdir -p /mnt/workspace/out
-
           echo "O_OUT=/mnt/workspace/out" >> "$GITHUB_OUTPUT"
 
       - name: Show inputs
@@ -121,13 +115,11 @@ jobs:
           clang-${{ inputs.llvm_version }} --version || true
           ld.lld-${{ inputs.llvm_version }} --version || true
 
-      # 新增：将无后缀工具映射到指定版本（解决 ld.lld: not found）
       - name: Map unsuffixed LLVM tool names to selected version
         shell: bash
         run: |
           set -eux
           VER="${{ inputs.llvm_version }}"
-          # 使用 update-alternatives 建立无后缀别名
           sudo update-alternatives --install /usr/bin/clang      clang      /usr/bin/clang-${VER}      100
           sudo update-alternatives --install /usr/bin/clang++    clang++    /usr/bin/clang++-${VER}    100
           sudo update-alternatives --install /usr/bin/ld.lld     ld.lld     /usr/bin/ld.lld-${VER}     100
@@ -136,7 +128,6 @@ jobs:
           sudo update-alternatives --install /usr/bin/llvm-objcopy llvm-objcopy /usr/bin/llvm-objcopy-${VER} 100
           sudo update-alternatives --install /usr/bin/llvm-objdump llvm-objdump /usr/bin/llvm-objdump-${VER} 100
           sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-${VER} 100
-          # 验证无后缀命令
           ld.lld --version
           clang  --version
 
@@ -146,7 +137,23 @@ jobs:
           set -eux
           git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo_url }}" kernel-src
 
+      - name: Init submodules (if any)
+        working-directory: kernel-src
+        shell: bash
+        run: |
+          set -eux
+          git submodule update --init --recursive || true
 
+      # ✅ 禁用 KernelSU 的 Kconfig 引入
+      - name: Disable KernelSU Kconfig include
+        working-directory: kernel-src
+        shell: bash
+        run: |
+          set -eux
+          if grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
+            sed -i 's|^[[:space:]]*source[[:space:]]*"drivers/kernelsu/Kconfig"|# disabled: KernelSU Kconfig not required|' drivers/Kconfig
+          fi
+          grep -n 'kernelsu' drivers/Kconfig || true
 
       - name: Resolve defconfig path
         id: defcfg
@@ -158,7 +165,6 @@ jobs:
           set -eux
           DF_IN="${{ inputs.defconfig_path }}"
           DF_BASENAME="$(basename "$DF_IN")"
-
           if [ -f "$DF_IN" ]; then
             DF_PATH="$DF_IN"
           else
@@ -171,8 +177,7 @@ jobs:
             DF_PATH=""
             for p in "${CANDIDATES[@]}"; do
               if [ -f "$p" ]; then
-                DF_PATH="$p"
-                break
+                DF_PATH="$p"; break
               fi
             done
             if [ -z "$DF_PATH" ]; then
@@ -181,14 +186,11 @@ jobs:
               exit 1
             fi
           fi
-
           echo "DF_TARGET=${DF_BASENAME}" >> "$GITHUB_OUTPUT"
           echo "DF_PATH=${DF_PATH}"       >> "$GITHUB_OUTPUT"
           echo "✔ 解析到 defconfig：$DF_PATH"
 
-      #####################################################################
-      # 下载并应用 LXC 补丁
-      #####################################################################
+      # LXC 补丁
       - name: Fetch LXC_utils.zip
         working-directory: kernel-src
         shell: bash
@@ -209,42 +211,26 @@ jobs:
         run: |
           set -euo pipefail
           echo "🔧 正在为内核安装 LXC 补丁..."
-
-          # 解压至 utils/
-          if [ ! -f "Patchs/LXC_utils.zip" ]; then
-            echo "⚠️ 未找到 Patchs/LXC_utils.zip，跳过 LXC 补丁步骤。" >&2
-            exit 0
-          fi
           rm -rf utils && unzip -o Patchs/LXC_utils.zip -d utils
-
-          # 引入 utils/Kconfig 到主 Kconfig（避免重复添加）
           if ! grep -q 'source "utils/Kconfig"' Kconfig; then
             echo 'source "utils/Kconfig"' >> Kconfig
           fi
-
           DEFCONFIG_FILE="$DF_PATH"
           if [ ! -f "$DEFCONFIG_FILE" ]; then
             echo "❌ 未找到 defconfig 文件：$DEFCONFIG_FILE" >&2
             exit 1
           fi
-
-          # 开启 Docker；关闭 ANDROID_PARANOID_NETWORK
           if ! grep -q '^CONFIG_DOCKER=y' "$DEFCONFIG_FILE"; then
             echo "CONFIG_DOCKER=y" >> "$DEFCONFIG_FILE"
           fi
           sed -i '/CONFIG_ANDROID_PARANOID_NETWORK/d' "$DEFCONFIG_FILE"
           echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> "$DEFCONFIG_FILE"
-
-          # runcpatch：两条常见路径都尝试
           chmod +x utils/runcpatch.sh
           [ -f kernel/cgroup/cgroup.c ] && sh utils/runcpatch.sh kernel/cgroup/cgroup.c || true
           [ -f kernel/cgroup.c ]       && sh utils/runcpatch.sh kernel/cgroup.c       || true
-
-          # xt_qtaguid 补丁（存在则尝试应用；失败不致命）
           if [ -f net/netfilter/xt_qtaguid.c ] && [ -f utils/xt_qtaguid.patch ]; then
             patch -p0 < utils/xt_qtaguid.patch || true
           fi
-
           echo "✅ LXC 补丁安装完成！"
 
       - name: Build kernel (LLVM=${{ inputs.llvm_version }})
@@ -254,7 +240,6 @@ jobs:
           set -eux
           export ARCH="${{ inputs.arch }}"
           export SUBARCH="${{ inputs.arch }}"
-          # 使用 10G 工作空间作为 O= 输出目录
           make O="${{ steps.ws.outputs.O_OUT }}" ARCH="${ARCH}" LLVM=-${{ inputs.llvm_version }} "${{ steps.defcfg.outputs.DF_TARGET }}"
           make -j"$(nproc)" O="${{ steps.ws.outputs.O_OUT }}" ARCH="${ARCH}" LLVM=-${{ inputs.llvm_version }}
 
@@ -350,7 +335,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 清理：卸载工作空间，删除镜像文件
       - name: Cleanup build workspace
         if: always()
         shell: bash
