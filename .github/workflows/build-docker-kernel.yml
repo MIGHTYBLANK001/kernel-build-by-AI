@@ -32,6 +32,16 @@ on:
         required: false
         default: "main"
         type: string
+      kernelsu_repo_url:
+        description: "KernelSU 仓库链接（WITH_KERNELSU=true 时生效）"
+        required: false
+        default: "https://github.com/tiann/KernelSU.git"
+        type: string
+      kernelsu_repo_ref:
+        description: "KernelSU 分支或标签（WITH_KERNELSU=true 时生效）"
+        required: false
+        default: "main"
+        type: string
 
   push:
     branches:
@@ -41,6 +51,7 @@ on:
       - "**/*.h"
       - "arch/**"
       - "include/**"
+      - "drivers/**"
       - "Makefile"
       - "Kbuild"
       - ".github/workflows/kernel-build.yml"
@@ -66,7 +77,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # === 默认设备（可复制扩展更多设备/defconfig）===
           - device: picasso
             defconfig_name: vendor/picasso_user_defconfig
             target_kernel_name: Driftwood-Kernel-picasso
@@ -74,23 +84,15 @@ jobs:
             anykernel_path: AnyKernel3-picasso
             anykernel_file: anykernel.zip
 
-          # 示例：添加另一个设备（请替换为真实 defconfig）
-          # - device: device2
-          #   defconfig_name: vendor/device2_user_defconfig
-          #   target_kernel_name: Driftwood-Kernel-device2
-          #   anykernel_url: https://codeload.github.com/EndCredits/AnyKernel3/zip/refs/heads/device2
-          #   anykernel_path: AnyKernel3-device2
-          #   anykernel_file: anykernel.zip
-
     env:
       ARCH: arm64
-      CC: clang                 # 将在步骤中用 ccache 包装
+      CC: clang
       LD: ld.lld
       CLANG_TRIPLE: aarch64-linux-gnu-
       CROSS_COMPILE: aarch64-linux-gnu-
       CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
       CC_ADDITION_FLAGS: "LD=ld.lld"
-      OUT: .out                 # ✅ 工作目录内的 .out，便于缓存与管理
+      OUT: .out
 
       DEFCONFIG_PATH: arch/arm64/configs
       DISABLE_KSU_FRAGMENT: vendor/disable_ksu.config
@@ -98,20 +100,14 @@ jobs:
       TARGET_KERNEL_DTB: arch/arm64/boot/dtb
       TARGET_KERNEL_DTBO: arch/arm64/boot/dtbo.img
 
-      # 来自矩阵
       DEFCONFIG_NAME: ${{ matrix.defconfig_name }}
       TARGET_KERNEL_NAME: ${{ matrix.target_kernel_name }}
       ANYKERNEL_URL: ${{ matrix.anykernel_url }}
       ANYKERNEL_PATH: ${{ matrix.anykernel_path }}
       ANYKERNEL_FILE: ${{ matrix.anykernel_file }}
 
-      # ccache
       CCACHE_DIR: ${{ github.workspace }}/.ccache
-
-      # LXC utils 下载地址（你提供的地址）
       LXC_UTILS_URL: https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/Patchs/LXC_utils.zip
-
-      # 默认内核源码目录（若提供外部链接则使用 kernel-src）
       KERNEL_SRC_DIR: kernel-src
 
     steps:
@@ -158,7 +154,6 @@ jobs:
           ld.lld --version
           ccache --version
 
-      # 解析与设置内核源码目录：若未提供链接则使用当前仓库
       - name: Resolve kernel source directory
         shell: bash
         run: |
@@ -171,7 +166,6 @@ jobs:
             echo "KERNEL_SRC_DIR=kernel-src" >> $GITHUB_ENV
           fi
 
-      # 若提供了外部链接则克隆
       - name: Clone kernel source (if provided)
         if: ${{ inputs.kernel_repo_url != '' }}
         shell: bash
@@ -214,16 +208,15 @@ jobs:
           echo "START_SEC=$START_SEC" >> $GITHUB_ENV
           echo "CURRENT_TIME=$CURRENT_TIME" >> $GITHUB_ENV
 
-          # 使用 ccache 包装 clang
           echo "CC=ccache clang" >> $GITHUB_ENV
 
-          # 计算 LOCAL_VERSION_NUMBER 与 kernelversion
           DEFCONFIG_FILE="$DEFCONFIG_PATH/$DEFCONFIG_NAME"
           if [ ! -f "$DEFCONFIG_FILE" ]; then
             echo "❌ 未找到 defconfig: $DEFCONFIG_FILE"
             ls -la "$DEFCONFIG_PATH" || true
             exit 1
           fi
+
           LOCAL_VERSION_NUMBER=$(grep -E '^CONFIG_LOCALVERSION=' "$DEFCONFIG_FILE" | cut -d '=' -f 2 | sed 's/"//g' | sed 's/-Driftwood-//g')
           echo "LOCAL_VERSION_NUMBER=$LOCAL_VERSION_NUMBER" >> $GITHUB_ENV
 
@@ -231,7 +224,6 @@ jobs:
           TARGET_KERNEL_MOD_VERSION="${KVER}-${LOCAL_VERSION_NUMBER}"
           echo "TARGET_KERNEL_MOD_VERSION=$TARGET_KERNEL_MOD_VERSION" >> $GITHUB_ENV
 
-          # KernelSU 开关
           if [ "${{ inputs.with_kernelsu }}" = "false" ]; then
             echo "WITH_KERNELSU=0" >> $GITHUB_ENV
             echo "KernelSU disabled"
@@ -245,7 +237,45 @@ jobs:
           echo "threads: $THREADS"
           echo "kernel source dir: $PWD"
 
-      # ---------- LXC 补丁（在编译前执行） ----------
+      # ---------- KernelSU 集成修复 ----------
+      - name: Prepare KernelSU integration
+        shell: bash
+        working-directory: ${{ env.KERNEL_SRC_DIR }}
+        run: |
+          set -e
+          echo "🔧 KernelSU 集成检查..."
+
+          # 1) 若启用 KernelSU：拉取源码到 drivers/kernelsu
+          if [ "$WITH_KERNELSU" = "1" ]; then
+            if [ ! -d drivers/kernelsu ]; then
+              echo "➜ 克隆 KernelSU: ${{ inputs.kernelsu_repo_url }} (ref: ${{ inputs.kernelsu_repo_ref }})"
+              git clone --depth 1 --branch "${{ inputs.kernelsu_repo_ref }}" "${{ inputs.kernelsu_repo_url }}" drivers/kernelsu
+            else
+              echo "• 已存在 drivers/kernelsu，跳过克隆"
+            fi
+          fi
+
+          # 2) 若禁用 KernelSU：防止 Kconfig 硬引用导致报错
+          if [ "$WITH_KERNELSU" = "0" ]; then
+            if grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
+              echo "⚠️ 检测到 drivers/Kconfig 引用了 KernelSU，禁用模式下进行兼容处理"
+              # 注释该行，避免 make defconfig 报错
+              sed -i 's|^\s*source "drivers/kernelsu/Kconfig"|# source "drivers/kernelsu/Kconfig" (disabled by workflow)|' drivers/Kconfig
+            fi
+            # 提供一个占位目录与空 Kconfig，避免其它地方引用
+            mkdir -p drivers/kernelsu
+            echo 'menu "KernelSU (disabled)"\nendmenu' > drivers/kernelsu/Kconfig
+          fi
+
+          # 提示最终状态
+          if [ -d drivers/kernelsu ]; then
+            echo "✓ drivers/kernelsu 目录存在"
+            ls -la drivers/kernelsu | head -n 20 || true
+          else
+            echo "• drivers/kernelsu 目录不存在（如果 WITH_KERNELSU=1，这将导致失败）"
+          fi
+
+      # ---------- LXC 补丁（编译前） ----------
       - name: Apply LXC patches (enable Docker, qtaguid, runcpatch)
         shell: bash
         working-directory: ${{ env.KERNEL_SRC_DIR }}
@@ -253,13 +283,11 @@ jobs:
           set -e
           echo "🔧 正在为内核安装 LXC 补丁..."
 
-          # 下载并解压 utils
           rm -rf utils LXC_utils.zip
           echo "➜ 下载 LXC utils: $LXC_UTILS_URL"
           curl -L "$LXC_UTILS_URL" -o LXC_utils.zip
           unzip -o LXC_utils.zip -d utils
 
-          # 将 utils/Kconfig 引入顶层 Kconfig（若未引入）
           if ! grep -q 'source "utils/Kconfig"' Kconfig; then
             echo 'source "utils/Kconfig"' >> Kconfig
             echo "✓ 已在 Kconfig 引入 utils/Kconfig"
@@ -267,7 +295,6 @@ jobs:
             echo "• Kconfig 已包含 utils/Kconfig"
           fi
 
-          # 修改 defconfig：启用 Docker，关闭 ANDROID_PARANOID_NETWORK
           DEFCONFIG_FILE="$DEFCONFIG_PATH/$DEFCONFIG_NAME"
           if [ ! -f "$DEFCONFIG_FILE" ]; then
             echo "❌ 未找到 defconfig: $DEFCONFIG_FILE"
@@ -285,7 +312,6 @@ jobs:
           echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> "$DEFCONFIG_FILE"
           echo "✓ 已禁用 ANDROID_PARANOID_NETWORK"
 
-          # 应用 runcpatch（两种 cgroup 路径兼容）
           chmod +x utils/runcpatch.sh
           if [[ -f kernel/cgroup/cgroup.c ]]; then
             sh utils/runcpatch.sh kernel/cgroup/cgroup.c || true
@@ -296,7 +322,6 @@ jobs:
             echo "✓ 已对 kernel/cgroup.c 应用 runcpatch"
           fi
 
-          # 应用 xt_qtaguid 补丁（若存在）
           if [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]]; then
             patch -p0 < utils/xt_qtaguid.patch || true
             echo "✓ 已应用 xt_qtaguid.patch"
@@ -306,7 +331,7 @@ jobs:
 
           echo "✅ LXC 补丁安装完成！"
 
-      # ---------- clean 放在前面（仅 cleanbuild） ----------
+      # ---------- clean（仅 cleanbuild） ----------
       - name: clean (for cleanbuild)
         if: ${{ inputs.operation == 'cleanbuild' }}
         shell: bash
@@ -382,7 +407,6 @@ jobs:
           echo " Linking DTB files .........."
           echo "------------------------------"
 
-          # 保持与原脚本一致：合并 vendor/qcom 下的所有 dtb 为一个文件
           find "$OUT/arch/arm64/boot/dts/vendor/qcom" -name '*.dtb' -exec cat {} + > "$OUT/arch/arm64/boot/dtb"
 
       # ---------- flashable ----------
@@ -458,7 +482,6 @@ jobs:
         run: |
           echo "Current version is: $LOCAL_VERSION_NUMBER"
 
-      # ---------- 上传 artifact ----------
       - name: Upload flashable zip
         if: ${{ inputs.operation == 'all' || inputs.operation == 'cleanbuild' || inputs.operation == 'flashable' }}
         uses: actions/upload-artifact@v4
@@ -467,7 +490,6 @@ jobs:
           path: ${{ env.TARGET_PKG_PATH }}
           if-no-files-found: error
 
-      # ---------- 发布到 Release（仅在 tag 推送） ----------
       - name: Publish Release (tag only)
         if: startsWith(github.ref, 'refs/tags/') && (inputs.operation == 'all' || inputs.operation == 'cleanbuild' || inputs.operation == 'flashable')
         uses: softprops/action-gh-release@v2
