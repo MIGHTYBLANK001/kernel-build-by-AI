@@ -14,7 +14,7 @@ on:
         required: false
 
 permissions:
-  contents: write   # 允许创建/更新 Release 与推送 tag
+  contents: write   # 需要创建/更新 Release 与推送 tag
 
 jobs:
   build:
@@ -23,9 +23,8 @@ jobs:
     env:
       TARGET_DEVICE: lmi
       BUILD_AOSP: "1"
-      KSU_ENABLE: "0"
       TOOLCHAIN_PATH: ${{ github.workspace }}/../proton-clang/proton-clang-20210522/bin
-      # ✅ 修复：把 ccache 目录改为绝对路径，避免出现 '..'（actions/cache 不允许）
+      # ✅ 修复：使用绝对路径，避免 '..' 相对路径导致 cache 保存失败
       CCACHE_DIR: $HOME/.cache/ccache_mikernel
       MAKE_ARGS: "ARCH=arm64 SUBARCH=arm64 O=out CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
 
@@ -34,6 +33,20 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # 计算安全的仓库短名和分支名（避免在表达式里用复杂的 ||），并形成安全的 artifact 名称
+      - name: Prepare safe names
+        id: names
+        shell: bash
+        run: |
+          set -e
+          KREPO="${{ inputs.kernel_repo }}"
+          KBRANCH="${{ inputs.kernel_branch }}"
+          # 取短名（repo 最后一段），同时保留 owner 作为前缀
+          SAFE_REPO="$(echo "${KREPO}" | sed 's#/#-#g')"     # e.g. Anr-C-kernel_xiaomi_sm8250_mod
+          [[ -z "${KBRANCH}" ]] && KBRANCH="default"
+          echo "safe_repo=${SAFE_REPO}" >> $GITHUB_OUTPUT
+          echo "safe_branch=${KBRANCH}" >> $GITHUB_OUTPUT
 
       # 检出目标内核源码（指定分支或默认分支）
       - name: Checkout target kernel repo (specific branch) to kernel-src
@@ -66,14 +79,13 @@ jobs:
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
           echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
 
-      # ✅ 使用 ccache action；不再出现相对路径保存问题
       - name: Enable ccache cache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: ${{ github.job }}-${{ inputs.kernel_repo }}-${{ inputs.kernel_branch }}-lmi-aosp
+          # key 中不包含非法字符
+          key: ${{ github.job }}-${{ steps.names.outputs.safe_repo }}-${{ steps.names.outputs.safe_branch }}-lmi-aosp
           max-size: 2G
           create-symlink: true
-          # 其余参数按默认即可（使用 actions/cache v4）[5](https://github.com/hendrikmuhs/ccache-action/blob/main/action.yml)[2](https://github.com/actions/cache)
 
       - name: Fetch Proton Clang 20210522
         run: |
@@ -118,7 +130,7 @@ jobs:
           if ! grep -q 'source "utils/Kconfig"' Kconfig; then
             echo 'source "utils/Kconfig"' >> Kconfig
           fi
-          # 开启 Docker 相关项（在 defconfig 中）
+          # 打开 Docker 并关闭 ANDROID_PARANOID_NETWORK
           if ! grep -q '^CONFIG_DOCKER=y' arch/arm64/configs/${TARGET_DEVICE}_defconfig; then
             echo "CONFIG_DOCKER=y" >> arch/arm64/configs/${TARGET_DEVICE}_defconfig
           fi
@@ -191,7 +203,6 @@ jobs:
             -d ANDROID_PARANOID_NETWORK \
             -e PSTORE_LAST_KMSG
 
-      # 使用 moby 的 check-config.sh 做 Docker/LXC 兼容性检查
       - name: Verify Docker/LXC requirements via moby check-config.sh
         working-directory: kernel-src
         run: |
@@ -199,7 +210,6 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh -o /tmp/check-config.sh
           chmod +x /tmp/check-config.sh
           /tmp/check-config.sh out/.config
-          # 这个脚本是 Docker/Moby 官方提供的内核配置校验工具。[6](https://github.com/XiaBei-cy/Thyme-Kernel-Builder)
 
       - name: Build kernel
         working-directory: kernel-src
@@ -235,11 +245,11 @@ jobs:
         run: |
           git restore --source=HEAD -- arch/arm64/configs/${TARGET_DEVICE}_defconfig || true
 
-      # ✅ 修复：artifact 名称去掉斜杠（/）
+      # ✅ 修复：artifact 名称去掉斜杠（/），使用安全值
       - name: Upload artifacts (zip, Image, dtb)
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-${{ replace(inputs.kernel_repo, '/', '-') }}-${{ inputs.kernel_branch || 'default' }}-lmi-aosp-${{ github.run_id }}
+          name: kernel-${{ steps.names.outputs.safe_repo }}-${{ steps.names.outputs.safe_branch }}-lmi-aosp-${{ github.run_id }}
           path: |
             kernel-src/${{ env.ZIP_FILENAME }}
             kernel-src/anykernel/kernels/Image
@@ -248,18 +258,17 @@ jobs:
             kernel-src/out/arch/arm64/boot/dts/**/*.dtb
           if-no-files-found: warn
 
-      # ====== 新增：发布到 Release（创建 tag 并上传 AnyKernel ZIP） ======
+      # ====== 发布到 Release（创建 tag 并上传 AnyKernel ZIP） ======
 
-      # 生成发布标签与名称
       - name: Prepare release tag/name
         id: relmeta
+        shell: bash
         run: |
           TAG="lmi-aosp-${{ github.run_id }}-${{ github.run_number }}"
           NAME="Kernel AOSP lmi (${TAG}) [kernel commit: ${KERNEL_COMMIT}]"
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
           echo "name=${NAME}" >> $GITHUB_OUTPUT
 
-      # 在工作流仓库创建并推送 tag（release 将发布在当前仓库）
       - name: Create and push tag
         run: |
           set -e
@@ -268,7 +277,6 @@ jobs:
           git tag "${{ steps.relmeta.outputs.tag }}"
           git push origin "${{ steps.relmeta.outputs.tag }}"
 
-      # 使用 softprops/action-gh-release 创建发布并上传 ZIP 资产
       - name: Create GitHub Release & upload AnyKernel ZIP
         uses: softprops/action-gh-release@v2
         with:
