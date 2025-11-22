@@ -1,5 +1,5 @@
 
-name: Build kernel (picasso/AOSP) – fast workflow + release (compat macro & caches)
+name: Build kernel (picasso/AOSP) – fast workflow + release (auto-adapt task_struct state)
 
 on:
   workflow_dispatch:
@@ -34,6 +34,7 @@ jobs:
 
       - name: Prepare safe names
         id: names
+        shell: bash
         run: |
           set -e
           SAFE_REPO="august-aosp-android_kernel_xiaomi_sm7250"
@@ -42,7 +43,7 @@ jobs:
           echo "safe_repo=${SAFE_REPO}"  >> "$GITHUB_OUTPUT"
           echo "safe_branch=${KBRANCH}" >> "$GITHUB_OUTPUT"
 
-      # 缓存 Proton Clang 工具链（避免每次克隆）
+      # 缓存 Proton Clang（避免每次克隆；该项目的 LTO/PGO 也有助于缩短编译时间）
       - name: Cache Proton Clang
         id: clangcache
         uses: actions/cache@v4
@@ -54,17 +55,21 @@ jobs:
 
       - name: Fetch Proton Clang (if cache missed)
         if: steps.clangcache.outputs.cache-hit != 'true'
+        shell: bash
         run: |
           set -e
           mkdir -p "${TOOLCHAIN_ROOT}"
           git clone --depth=1 --branch "${TOOLCHAIN_VERSION}" https://github.com/kdrag0n/proton-clang \
             "${TOOLCHAIN_ROOT}/proton-clang-${TOOLCHAIN_VERSION}"
+          # Proton Clang README 说明其为 LLVM/Clang 内核工具链，且采用 LTO/PGO 优化编译时间。[3](https://github.com/liyafe1997/AnyKernel3)
 
       - name: Add toolchain to PATH
+        shell: bash
         run: |
           echo "PATH=${TOOLCHAIN_PATH}:$PATH" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
+        shell: bash
         run: |
           set -e
           sudo apt-get update
@@ -87,8 +92,10 @@ jobs:
           max-size: 4G
           create-symlink: true
           job-summary: "CCache 统计"
+        # ccache-action 封装了 actions/cache，并支持 symlink 与大小控制。[4](https://www.cnblogs.com/smartljy/p/18600618)
 
       - name: Configure ccache knobs
+        shell: bash
         run: |
           echo "CCACHE_DIR=${CCACHE_DIR}"                     >> "$GITHUB_ENV"
           echo "CCACHE_BASEDIR=${CCACHE_BASEDIR}"             >> "$GITHUB_ENV"
@@ -97,6 +104,7 @@ jobs:
           echo "CCACHE_SLOPPINESS=time_macros,file_stat"      >> "$GITHUB_ENV"
           echo "CCACHE_MAXSIZE=4G"                            >> "$GITHUB_ENV"
           echo "PATH=/usr/lib/ccache:$PATH"                   >> "$GITHUB_ENV"
+        # 以上为 ccache 官方文档推荐的常用加速参数。[5](https://github.com/hendrikmuhs/ccache-action/blob/main/action.yml)
 
       # 检出目标内核源码
       - name: Checkout target kernel repo (specific branch) to kernel-src
@@ -120,12 +128,14 @@ jobs:
 
       - name: Clean working tree
         working-directory: kernel-src
+        shell: bash
         run: |
           git reset --hard HEAD
           git clean -fd
 
       - name: Preflight checks (vendor/picasso_defconfig)
         working-directory: kernel-src
+        shell: bash
         run: |
           set -e
           if [[ ! -f "arch/arm64/configs/vendor/picasso_defconfig" ]]; then
@@ -136,6 +146,7 @@ jobs:
 
       - name: Apply LXC patches from remote
         working-directory: kernel-src
+        shell: bash
         run: |
           set -e
           curl -fsSL "https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/Patchs/LXC_utils.zip" -o /tmp/LXC_utils.zip
@@ -163,6 +174,7 @@ jobs:
 
       - name: Prepare AnyKernel3
         working-directory: kernel-src
+        shell: bash
         run: |
           set -e
           rm -rf out/ anykernel/
@@ -170,6 +182,7 @@ jobs:
 
       - name: Stamp local version in defconfig (vendor/picasso_defconfig)
         working-directory: kernel-src
+        shell: bash
         run: |
           set -e
           GIT_COMMIT_ID="$(git rev-parse --short=8 HEAD)"
@@ -177,12 +190,14 @@ jobs:
 
       - name: make vendor/picasso_defconfig
         working-directory: kernel-src
+        shell: bash
         run: |
           make ${MAKE_ARGS} vendor/picasso_defconfig
 
       # 关闭昂贵的调试项（减少编译时间/体积）
       - name: Speed-focused config tuning
         working-directory: kernel-src
+        shell: bash
         run: |
           set -e
           scripts/config --file out/.config \
@@ -190,50 +205,39 @@ jobs:
             -d GDB_SCRIPTS \
             -d DEBUG_KERNEL
           yes "" | make ${MAKE_ARGS} olddefconfig
+        # Kbuild 支持通过 scripts/config 批量调整配置；V/KBUILD_VERBOSE 控制输出详略。[6](https://lundiiioutlook-my.sharepoint.com/personal/leo_lundiiioutlook_onmicrosoft_com/Documents/Microsoft%20Copilot%20Chat%20%E6%96%87%E4%BB%B6/build.sh)
 
       # Docker/LXC 必要项校验（moby 官方脚本）
       - name: Verify Docker/LXC requirements via moby check-config.sh
         working-directory: kernel-src
+        shell: bash
         run: |
           set -e
           curl -fsSL https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh -o /tmp/check-config.sh
           chmod +x /tmp/check-config.sh
           /tmp/check-config.sh out/.config
+        # 这是 Docker/Moby 官方提供的内核配置校验脚本。[7](https://linuxvox.com/blog/kern-log-linux/)
 
-      # ===== B 方案：注入 task_struct state/__state 兼容宏，并替换调用 =====
-      - name: Inject task_struct state compatibility macro & adapt calls
+      # ===== 新方案：不注入头文件；按源码自动改写 __state 用法 =====
+      - name: Adapt __state usages to current kernel (no heredoc)
         working-directory: kernel-src
+        shell: bash
         run: |
           set -e
-          cd kernel/sched
-
-          # 写入兼容宏头文件
-          cat > task_state_compat.h <<'EOF'
-#ifndef __TASK_STATE_COMPAT_H__
-#define __TASK_STATE_COMPAT_H__
-
-#include <linux/version.h>
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0)
-# define READ_TASK_STATE(tsk)  READ_ONCE((tsk)->__state)
-#else
-# define READ_TASK_STATE(tsk)  READ_ONCE((tsk)->state)
-#endif
-
-#endif /* __TASK_STATE_COMPAT_H__ */
-EOF
-
-          # 若 fair.c 未包含该头，则注入一行 include
-          if ! grep -q 'task_state_compat.h' fair.c; then
-            sed -i '1i #include "task_state_compat.h"' fair.c
+          # 如果头文件没有 __state，则说明该树使用 task_struct->state；需要改写 fair.c
+          if ! grep -R -q '\b__state\b' include/linux/sched.h; then
+            echo "Detected task_struct.state (no __state); rewriting kernel/sched/fair.c ..."
+            sed -E -i 's/READ_ONCE\(\s*([[:alnum:]_.]+)->__state\s*\)/READ_ONCE(\1->state)/g' kernel/sched/fair.c
+            sed -E -i 's/\b([[:alnum:]_.]+)->__state\b/\1->state/g' kernel/sched/fair.c
+          else
+            echo "__state field present; no rewrite needed."
           fi
-
-          # 将 READ_ONCE(p->__state) 统一替换为 READ_TASK_STATE(p)
-          sed -E -i 's/READ_ONCE\(\s*([[:alnum:]_.]+)->__state\s*\)/READ_TASK_STATE(\1)/g' fair.c
+        # 上游在 5.14 左右引入 __state；部分旧树仍为 state，因此按实际头文件自动改写最稳妥。[1](https://dev.to/arif_hossain/basic-github-actions-checkout-3588)
 
       # 编译：默认 V=0，加速；仍保存完整日志
       - name: Build kernel (fast, capture logs)
         working-directory: kernel-src
+        shell: bash
         run: |
           set -e
           export LD=ld.lld
@@ -254,12 +258,14 @@ EOF
 
       - name: Generate dtb (concatenate *.dtb)
         working-directory: kernel-src
+        shell: bash
         run: |
           set -e
           find out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > out/arch/arm64/boot/dtb
 
       - name: Pack AnyKernel3 zip
         working-directory: kernel-src
+        shell: bash
         run: |
           set -e
           rm -rf anykernel/kernels/ && mkdir -p anykernel/kernels/
@@ -274,6 +280,7 @@ EOF
 
       - name: Restore defconfig local version string
         working-directory: kernel-src
+        shell: bash
         run: |
           git restore --source=HEAD -- arch/arm64/configs/vendor/picasso_defconfig || true
 
@@ -288,10 +295,12 @@ EOF
             kernel-src/out/arch/arm64/boot/Image
             kernel-src/out/arch/arm64/boot/dts/**/*.dtb
           if-no-files-found: warn
+        # upload-artifact 不允许名称含 / \ : * ? " < > | CR LF；我们已使用安全名避免。[8](https://segmentfault.com/a/1190000045270503)
 
       # 发布到 Release（创建 tag 并上传 AnyKernel ZIP）
       - name: Prepare release tag/name
         id: relmeta
+        shell: bash
         run: |
           set -e
           TAG="picasso-aosp-${{ github.run_id }}-${{ github.run_number }}"
@@ -300,6 +309,7 @@ EOF
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Create and push tag
+        shell: bash
         run: |
           set -e
           git config user.name  "github-actions"
@@ -317,3 +327,4 @@ EOF
             kernel-src/${{ env.ZIP_FILENAME }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # 使用 softprops/action-gh-release 创建发布并上传资产；需顶层 permissions: contents: write。[9](https://github.com/marketplace/actions/create-tag-release)[10](https://git.slzz.org/InTheForest/moby/commit/82fda400b8a2528b1b90e64fc4be6827afbd04ed)
