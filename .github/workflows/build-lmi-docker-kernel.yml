@@ -279,4 +279,3 @@ jobs:
             kernel-src/${{ env.ZIP_FILENAME }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # 这个 action 是当前社区常用的创建发布并上传资产的方式。[4](https://github.com/softprops/action-gh-release)
