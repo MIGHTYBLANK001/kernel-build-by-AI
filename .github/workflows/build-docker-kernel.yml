@@ -7,22 +7,22 @@ on:
       kernel_repo_url:
         description: "内核源码仓库地址"
         required: true
-        default: "https://github.com/august-aosp/android_kernel_xiaomi_sm7250"
+        default: ""
         type: string
       kernel_branch:
         description: "内核源码分支或标签（默认 main）"
         required: true
-        default: "stable"
+        default: ""
         type: string
       device_codename:
         description: "机型代号（例如 'beryllium'、'xaga' 等）"
         required: true
-        default: "picasso"
+        default: ""
         type: string
       defconfig_path:
         description: "defconfig 路径或文件名（如 'arch/arm64/configs/<codename>_defconfig' 或 '<codename>_defconfig'）"
         required: true
-        default: "vendor/picasso_defconfig"
+        default: ""
         type: string
       arch:
         description: "编译架构（默认 arm64）"
