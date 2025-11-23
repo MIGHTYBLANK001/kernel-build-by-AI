@@ -1,13 +1,13 @@
-name: Kernel Build (Vanilla Only & Google Toolchain)
+name: Kernel Build (Vanilla Only & Google Toolchain Latest)
 
 on:
   workflow_dispatch:
     inputs:
-      # --- 核心配置 ---
+      # --- 核心配置 (默认值设为空，但 Required 项运行时仍需提供) ---
       kernel_source_url:
         description: '内核源码仓库地址'
         required: true
-        default: 'https://github.com/User/repo.git'
+        default: '' # 默认为空
       kernel_source_branch:
         description: '源码分支 (留空默认)'
         required: false
@@ -15,11 +15,11 @@ on:
       device_code:
         description: '机型代码 (DEVICE)'
         required: true
-        default: 'rosemary'
+        default: '' # 默认为空
       defconfig_name:
         description: 'Defconfig 路径 (例如 vendor/rosemary_defconfig)'
         required: true
-        default: 'vendor/rosemary_defconfig'
+        default: '' # 默认为空
       
       # --- 功能开关 ---
       enable_lxc:
@@ -39,8 +39,8 @@ jobs:
       BUILD_VARIANT: vanilla
 
     steps:
-    # 1. 环境配置
-    - name: Setup Build Environment
+    # 1. 环境配置 (新增安装 jq)
+    - name: Setup Build Environment and Install jq
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
@@ -48,30 +48,45 @@ jobs:
           git gnupg gperf imagemagick libncurses-dev libsdl1.2-dev \
           libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
           squashfs-tools xsltproc zip zlib1g-dev python3 python3-pip wget unzip \
-          lib32readline-dev lib32z1-dev liblz4-tool
+          lib32readline-dev lib32z1-dev liblz4-tool jq # <<== 新增 jq
         sudo ln -sf /usr/bin/python3 /usr/bin/python
 
-    # 2. 【已修改】下载 Google 官方 LLVM/Clang 和 GNU 工具链 (AOSP Prebuilts)
-    - name: Download Official Google Toolchains
+    # 2. 【已修改】下载 Google 官方 LLVM/Clang 和 GNU 工具链 (自动检测最新版本)
+    - name: Download Official Google Toolchains (Latest Clang)
       run: |
+        set -e
         TOOLCHAIN_DIR="$GITHUB_WORKSPACE/toolchain"
         mkdir -p "$TOOLCHAIN_DIR"
         
-        # A. 下载 Google LLVM/Clang (使用 LLVM 17.0.6 官方发布版本)
-        CLANG_VERSION="17.0.6"
-        CLANG_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${CLANG_VERSION}/clang+llvm-${CLANG_VERSION}-x86_64-linux-gnu.tar.xz"
-        echo "Downloading Clang ${CLANG_VERSION}..."
-        wget -q "$CLANG_URL" -O "$TOOLCHAIN_DIR/clang.tar.xz"
-        # 解压到 toolchain/bin (注意：--strip-components=1 保持干净的结构)
+        # A. 动态检测并下载 Google LLVM/Clang
+        echo "🔍 正在自动检测最新的 LLVM/Clang Release 版本..."
+        LATEST_TAG=$(curl -sL "https://api.github.com/repos/llvm/llvm-project/releases/latest" | jq -r '.tag_name')
+        
+        if [ -z "$LATEST_TAG" ] || [[ "$LATEST_TAG" != llvmorg-* ]]; then
+            echo "❌ 错误: 无法获取最新的 LLVM Release Tag 或格式不正确: $LATEST_TAG"
+            exit 1
+        fi
+        
+        CLANG_VERSION=$(echo "$LATEST_TAG" | sed 's/llvmorg-//')
+        CLANG_URL="https://github.com/llvm/llvm-project/releases/download/$LATEST_TAG/clang+llvm-${CLANG_VERSION}-x86_64-linux-gnu.tar.xz"
+        
+        echo "✅ 自动检测到最新的 Clang 版本为: $CLANG_VERSION"
+        echo "Downloading Clang from: $CLANG_URL"
+        
+        wget "$CLANG_URL" -O "$TOOLCHAIN_DIR/clang.tar.xz"
+        if [ $? -ne 0 ]; then echo "❌ 错误: Clang 下载失败。"; exit 1; fi
+        
         tar -xf "$TOOLCHAIN_DIR/clang.tar.xz" -C "$TOOLCHAIN_DIR" --strip-components=1
 
-        # B. 下载 Google GNU Binutils/GCC (AOSP aarch64-linux-android-4.9)
-        # 兼容旧内核或需要 aarch64-linux-android- 链接器的环境
+        # B. 下载 Google GNU Binutils/GCC
         GNU_URL="https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9/archive/refs/heads/master.tar.gz"
         GNU_DIR="$TOOLCHAIN_DIR/gcc-aarch64"
         mkdir -p "$GNU_DIR"
-        echo "Downloading AOSP GNU Toolchain..."
-        wget -q "$GNU_URL" -O "$TOOLCHAIN_DIR/gcc-aarch64.tar.gz"
+        echo "Downloading AOSP GNU Toolchain from LineageOS Mirror..."
+        
+        wget "$GNU_URL" -O "$TOOLCHAIN_DIR/gcc-aarch64.tar.gz"
+        if [ $? -ne 0 ]; then echo "❌ 错误: GNU Toolchain 下载失败。"; exit 1; fi
+        
         tar -xf "$TOOLCHAIN_DIR/gcc-aarch64.tar.gz" -C "$GNU_DIR" --strip-components=1
         
         echo "✅ Google 官方工具链下载并解压完毕。"
@@ -147,7 +162,7 @@ jobs:
         [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]] && patch -p0 < utils/xt_qtaguid.patch || true
         echo "✅ LXC 补丁应用完成"
 
-    # 6. 【已优化】核心编译和打包逻辑 (编译 Image 和 DTBs)
+    # 6. 核心编译和打包逻辑 (只编译目标机型内核文件)
     - name: Build and Package Kernel (Vanilla)
       working-directory: workspace
       run: |
@@ -186,14 +201,12 @@ jobs:
         # 执行 Defconfig
         make $BUILD_ARGS "$DEFCONFIG_NAME" 
 
-        # --- 2. 【核心编译】编译 Image 和所有 DTBs ---
+        # --- 2. 核心编译：编译 Image 和所有 DTBs ---
         echo "--- 2. BUILDING KERNEL IMAGE AND DTBS ---"
-        # 明确指定 Image 和 dtbs 目标，确保一次性完成所有必要文件
         make $BUILD_ARGS Image dtbs 
 
-        # --- 3. 【链接】链接 DTB 文件 ---
+        # --- 3. 链接 DTB 文件 ---
         echo "--- 3. LINKING DTB FILES ---"
-        # 仅执行合并操作
         find "$OUT/arch/arm64/boot/dts/vendor/qcom" -name '*.dtb' -exec cat {} + > "$OUT/$TARGET_KERNEL_DTB"
 
         # --- 4. 生成可刷写包 ---
