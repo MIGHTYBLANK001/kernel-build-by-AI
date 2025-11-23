@@ -1,4 +1,4 @@
-name: Kernel Build (Vanilla Only & Google Toolchain Latest)
+name: Kernel Build (Vanilla Only & Stable Google Toolchain)
 
 on:
   workflow_dispatch:
@@ -39,8 +39,8 @@ jobs:
       BUILD_VARIANT: vanilla
 
     steps:
-    # 1. 环境配置 (新增安装 jq)
-    - name: Setup Build Environment and Install jq
+    # 1. 环境配置
+    - name: Setup Build Environment
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
@@ -48,41 +48,34 @@ jobs:
           git gnupg gperf imagemagick libncurses-dev libsdl1.2-dev \
           libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
           squashfs-tools xsltproc zip zlib1g-dev python3 python3-pip wget unzip \
-          lib32readline-dev lib32z1-dev liblz4-tool jq # <<== 新增 jq
+          lib32readline-dev lib32z1-dev liblz4-tool jq
         sudo ln -sf /usr/bin/python3 /usr/bin/python
 
-    # 2. 【已修改】下载 Google 官方 LLVM/Clang 和 GNU 工具链 (自动检测最新版本)
-    - name: Download Official Google Toolchains (Latest Clang)
+    # 2. 【已修复】下载 Google 官方工具链 (使用稳定 AOSP Clang Git 镜像)
+    - name: Download Official Google Toolchains (Stable AOSP Clang)
       run: |
         set -e
         TOOLCHAIN_DIR="$GITHUB_WORKSPACE/toolchain"
         mkdir -p "$TOOLCHAIN_DIR"
         
-        # A. 动态检测并下载 Google LLVM/Clang
-        echo "🔍 正在自动检测最新的 LLVM/Clang Release 版本..."
-        LATEST_TAG=$(curl -sL "https://api.github.com/repos/llvm/llvm-project/releases/latest" | jq -r '.tag_name')
+        # A. 下载稳定 AOSP Clang (r498227b 对应 LLVM 17)
+        CLANG_REPO="https://github.com/kdrag0n/aosp-clang"
+        CLANG_VERSION="r498227b" 
+        CLANG_TARGET="$TOOLCHAIN_DIR/aosp-clang"
         
-        if [ -z "$LATEST_TAG" ] || [[ "$LATEST_TAG" != llvmorg-* ]]; then
-            echo "❌ 错误: 无法获取最新的 LLVM Release Tag 或格式不正确: $LATEST_TAG"
+        echo "⚠️ 修复 404 错误：切换到已知的稳定 AOSP Clang 版本: ${CLANG_VERSION}"
+        git clone --depth=1 "$CLANG_REPO" "$CLANG_TARGET" -b "$CLANG_VERSION"
+        
+        if [ $? -ne 0 ]; then
+            echo "❌ 错误: AOSP Clang 克隆失败。请检查仓库状态。"
             exit 1
         fi
         
-        CLANG_VERSION=$(echo "$LATEST_TAG" | sed 's/llvmorg-//')
-        CLANG_URL="https://github.com/llvm/llvm-project/releases/download/$LATEST_TAG/clang+llvm-${CLANG_VERSION}-x86_64-linux-gnu.tar.xz"
-        
-        echo "✅ 自动检测到最新的 Clang 版本为: $CLANG_VERSION"
-        echo "Downloading Clang from: $CLANG_URL"
-        
-        wget "$CLANG_URL" -O "$TOOLCHAIN_DIR/clang.tar.xz"
-        if [ $? -ne 0 ]; then echo "❌ 错误: Clang 下载失败。"; exit 1; fi
-        
-        tar -xf "$TOOLCHAIN_DIR/clang.tar.xz" -C "$TOOLCHAIN_DIR" --strip-components=1
-
-        # B. 下载 Google GNU Binutils/GCC
+        # B. 下载 Google GNU Binutils/GCC (保持不变)
         GNU_URL="https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9/archive/refs/heads/master.tar.gz"
         GNU_DIR="$TOOLCHAIN_DIR/gcc-aarch64"
         mkdir -p "$GNU_DIR"
-        echo "Downloading AOSP GNU Toolchain from LineageOS Mirror..."
+        echo "Downloading AOSP GNU Toolchain..."
         
         wget "$GNU_URL" -O "$TOOLCHAIN_DIR/gcc-aarch64.tar.gz"
         if [ $? -ne 0 ]; then echo "❌ 错误: GNU Toolchain 下载失败。"; exit 1; fi
@@ -162,7 +155,7 @@ jobs:
         [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]] && patch -p0 < utils/xt_qtaguid.patch || true
         echo "✅ LXC 补丁应用完成"
 
-    # 6. 核心编译和打包逻辑 (只编译目标机型内核文件)
+    # 6. 核心编译和打包逻辑 (路径已适配新的工具链结构)
     - name: Build and Package Kernel (Vanilla)
       working-directory: workspace
       run: |
@@ -184,8 +177,8 @@ jobs:
         TARGET_KERNEL_DTB="arch/arm64/boot/dtb"
         TARGET_KERNEL_DTBO="arch/arm64/boot/dtbo.img"
         
-        # 路径设置
-        CLANG_BIN_PATH="$GITHUB_WORKSPACE/toolchain/bin"
+        # 路径设置：新的 AOSP Clang 路径和 GNU GCC 路径
+        CLANG_BIN_PATH="$GITHUB_WORKSPACE/toolchain/aosp-clang/bin"
         GNU_BIN_PATH="$GITHUB_WORKSPACE/toolchain/gcc-aarch64/bin"
         export PATH=$CLANG_BIN_PATH:$GNU_BIN_PATH:$PATH
         
