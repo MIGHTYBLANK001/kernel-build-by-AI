@@ -48,7 +48,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
           bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
-          git gnupg gperf imagemagick libncurses-dev libsdl1.2-dev \
+          git gnupg gperf imagemagik libncurses-dev libsdl1.2-dev \
           libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
           squashfs-tools xsltproc zip zlib1g-dev python3 python3-pip wget unzip \
           lib32readline-dev lib32z1-dev liblz4-tool jq
@@ -109,7 +109,7 @@ jobs:
         [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]] && patch -p0 < utils/xt_qtaguid.patch || true
         echo "✅ LXC 补丁应用完成"
 
-    # 5. 检查 LXC 补丁配置是否有效
+    # 5. 检查 LXC 补丁配置是否有效 (修复 HOSTCC 错误)
     - name: Verify Docker/LXC requirements via moby check-config.sh
       if: ${{ inputs.enable_lxc }}
       working-directory: workspace
@@ -118,8 +118,8 @@ jobs:
         OUT_PATH="../out/${{ inputs.device_code }}/${{ env.BUILD_VARIANT }}"
         echo "🔍 正在检查 LXC/Docker 依赖配置..."
 
-        # 运行 defconfig 生成 .config 文件
-        make ${BUILD_ARGS_BASE} O=$OUT_PATH ${{ inputs.defconfig_name }}
+        # 【修复点 1】添加 HOSTCC=gcc 来编译主机工具 (fixdep, etc.)
+        make ${BUILD_ARGS_BASE} O=$OUT_PATH ${{ inputs.defconfig_name }} HOSTCC=gcc
         
         # 下载并运行 moby 脚本进行检查
         curl -fsSL https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh -o /tmp/check-config.sh
@@ -127,7 +127,7 @@ jobs:
         /tmp/check-config.sh $OUT_PATH/.config
         echo "✅ 配置检查通过。"
         
-    # 6. 编译内核，然后打包
+    # 6. 编译内核，然后打包 (修复 HOSTCC 错误)
     - name: Build and Package Kernel (Vanilla)
       working-directory: workspace
       run: |
@@ -142,13 +142,14 @@ jobs:
         ANYKERNEL_DIR="AnyKernel3"
         DEFCONFIG_FULL_PATH="arch/arm64/configs/$DEFCONFIG_NAME"
         
-        # 编译参数
-        BUILD_ARGS="$BUILD_ARGS_BASE O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner KBUILD_CFLAGS+='-Wno-unused-command-line-argument'"
+        # 【修复点 2】在 BUILD_ARGS 中添加 HOSTCC=gcc
+        BUILD_ARGS="$BUILD_ARGS_BASE O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner KBUILD_CFLAGS+='-Wno-unused-command-line-argument' HOSTCC=gcc" 
 
         # --- 1. 清理和配置 ---
         echo "--- 1. CLEANING AND CONFIGURING ---"
-        make -s mrproper -j$THREAD
-        make -s clean -j$THREAD
+        # 【修复点 3】清理命令也必须包含 HOSTCC=gcc
+        make -s mrproper -j$THREAD HOSTCC=gcc
+        make -s clean -j$THREAD HOSTCC=gcc
         rm -rf "$OUT"
         
         # 执行 Defconfig
@@ -161,7 +162,7 @@ jobs:
         # --- 3. 链接 DTB 文件 (通用兼容模式) ---
         echo "--- 3. LINKING DTB FILES (Generic) ---"
         TARGET_KERNEL_DTB="arch/arm64/boot/dtb"
-        # 在整个 dts 目录中递归查找并合并所有 *.dtb 文件
+        # 在整个 dts 目录中递归查找并合并所有 *.dtb 文件，增强通用性
         find "$OUT/arch/arm64/boot/dts" -name '*.dtb' -exec cat {} + > "$OUT/$TARGET_KERNEL_DTB"
         
         # --- 4. 生成可刷写包 ---
