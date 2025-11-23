@@ -1,0 +1,219 @@
+name: Kernel Build (Vanilla Only & Latest Proton Clang)
+
+on:
+  workflow_dispatch:
+    inputs:
+      # --- 核心配置 (通用性高，默认输入为空) ---
+      kernel_source_url:
+        description: '内核源码仓库地址 (owner/repo)'
+        required: true
+        default: ''
+      kernel_source_branch:
+        description: '源码分支 (留空则克隆默认分支)'
+        required: false
+        default: ''
+      device_code:
+        description: '机型代码 (DEVICE)'
+        required: true
+        default: ''
+      defconfig_name:
+        description: 'Defconfig 名称 (例如: lmi_defconfig)'
+        required: true
+        default: ''
+      
+      # --- 功能开关 ---
+      enable_lxc:
+        description: '启用 LXC/Docker 补丁?'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  build-vanilla-only:
+    name: Build Vanilla Kernel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      
+    env:
+      BUILD_VARIANT: vanilla
+      TOOLCHAIN_CLONE_DIR: ${{ github.workspace }}/toolchain/proton-clang
+      # 通用编译参数：适用于绝大多数基于 AOSP/Google 标准的内核
+      BUILD_ARGS_BASE: "CC=clang ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1"
+
+    steps:
+    # 1. 环境配置与依赖安装
+    - name: Setup Build Environment and Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+          git gnupg gperf imagemagick libncurses-dev libsdl1.2-dev \
+          libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
+          squashfs-tools xsltproc zip zlib1g-dev python3 python3-pip wget unzip \
+          lib32readline-dev lib32z1-dev liblz4-tool jq
+        sudo ln -sf /usr/bin/python3 /usr/bin/python
+
+    # 2. 配置工具链 (Proton Clang 最新版本)
+    - name: Download Latest Proton Clang Toolchain
+      run: |
+        set -e
+        CLANG_REPO="https://github.com/kdrag0n/proton-clang"
+        mkdir -p "$TOOLCHAIN_CLONE_DIR"
+        
+        # 总是克隆最新版本 (默认分支)
+        git clone --depth=1 "$CLANG_REPO" "$TOOLCHAIN_CLONE_DIR" || { echo "❌ Clang 克隆失败"; exit 1; }
+        
+        # 设置 PATH 环境变量
+        echo "PATH=${TOOLCHAIN_CLONE_DIR}/bin:$PATH" >> $GITHUB_ENV
+        echo "✅ Proton Clang 工具链下载并设置 PATH 完毕。"
+        
+    # 3. 下载内核源码
+    - name: Clone Kernel Source
+      run: |
+        URL="${{ inputs.kernel_source_url }}"
+        BRANCH="${{ inputs.kernel_source_branch }}"
+        
+        if [ -z "$BRANCH" ]; then
+          git clone --depth=1 "$URL" workspace
+        else
+          git clone --depth=1 -b "$BRANCH" "$URL" workspace
+        fi
+
+    # 4. 应用 LXC 补丁
+    - name: Apply LXC patches
+      if: ${{ inputs.enable_lxc }}
+      working-directory: workspace
+      run: |
+        set -e
+        echo "🔧 正在应用 LXC 补丁..."
+        LXC_URL="https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/Patchs/LXC_utils.zip"
+        DEFCONFIG_FILE="arch/arm64/configs/${{ inputs.defconfig_name }}"
+        
+        wget -q "$LXC_URL" -O LXC_utils.zip
+        rm -rf utils && unzip -o LXC_utils.zip -d utils && rm LXC_utils.zip
+
+        if [ -f "Kconfig" ]; then
+            grep -q 'source "utils/Kconfig"' Kconfig || echo 'source "utils/Kconfig"' >> Kconfig
+        fi
+        
+        if [ -f "$DEFCONFIG_FILE" ]; then
+            grep -q '^CONFIG_DOCKER=y' "$DEFCONFIG_FILE" || echo "CONFIG_DOCKER=y" >> "$DEFCONFIG_FILE"
+            sed -i '/CONFIG_ANDROID_PARANOID_NETWORK/d' "$DEFCONFIG_FILE"
+            echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> "$DEFCONFIG_FILE"
+        fi
+        
+        chmod +x utils/runcpatch.sh
+        [[ -f kernel/cgroup/cgroup.c ]] && sh utils/runcpatch.sh kernel/cgroup/cgroup.c
+        [[ -f kernel/cgroup.c ]] && sh utils/runcpatch.sh kernel/cgroup.c
+        [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]] && patch -p0 < utils/xt_qtaguid.patch || true
+        echo "✅ LXC 补丁应用完成"
+
+    # 5. 检查 LXC 补丁配置是否有效
+    - name: Verify Docker/LXC requirements via moby check-config.sh
+      if: ${{ inputs.enable_lxc }}
+      working-directory: workspace
+      run: |
+        set -e
+        OUT_PATH="../out/${{ inputs.device_code }}/${{ env.BUILD_VARIANT }}"
+        echo "🔍 正在检查 LXC/Docker 依赖配置..."
+
+        # 运行 defconfig 生成 .config 文件
+        make ${BUILD_ARGS_BASE} O=$OUT_PATH ${{ inputs.defconfig_name }}
+        
+        # 下载并运行 moby 脚本进行检查
+        curl -fsSL https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh -o /tmp/check-config.sh
+        chmod +x /tmp/check-config.sh
+        /tmp/check-config.sh $OUT_PATH/.config
+        echo "✅ 配置检查通过。"
+        
+    # 6. 编译内核，然后打包
+    - name: Build and Package Kernel (Vanilla)
+      working-directory: workspace
+      run: |
+        set -e
+        
+        # --- 变量定义 ---
+        DEVICE="${{ inputs.device_code }}"
+        DEFCONFIG_NAME="${{ inputs.defconfig_name }}"
+        BUILD_VARIANT="${{ env.BUILD_VARIANT }}"
+        THREAD=$(nproc --all)
+        OUT="../out/$DEVICE/$BUILD_VARIANT"
+        ANYKERNEL_DIR="AnyKernel3"
+        DEFCONFIG_FULL_PATH="arch/arm64/configs/$DEFCONFIG_NAME"
+        
+        # 编译参数
+        BUILD_ARGS="$BUILD_ARGS_BASE O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner KBUILD_CFLAGS+='-Wno-unused-command-line-argument'"
+
+        # --- 1. 清理和配置 ---
+        echo "--- 1. CLEANING AND CONFIGURING ---"
+        make -s mrproper -j$THREAD
+        make -s clean -j$THREAD
+        rm -rf "$OUT"
+        
+        # 执行 Defconfig
+        make $BUILD_ARGS "$DEFCONFIG_NAME" 
+        
+        # --- 2. 核心编译：编译 Image 和所有 DTBs ---
+        echo "--- 2. BUILDING KERNEL IMAGE AND DTBS ---"
+        make $BUILD_ARGS Image dtbs 
+
+        # --- 3. 链接 DTB 文件 (通用兼容模式) ---
+        echo "--- 3. LINKING DTB FILES (Generic) ---"
+        TARGET_KERNEL_DTB="arch/arm64/boot/dtb"
+        # 在整个 dts 目录中递归查找并合并所有 *.dtb 文件
+        find "$OUT/arch/arm64/boot/dts" -name '*.dtb' -exec cat {} + > "$OUT/$TARGET_KERNEL_DTB"
+        
+        # --- 4. 生成可刷写包 ---
+        echo "--- 4. GENERATING FLASHABLE ZIP ---"
+        
+        mkdir -p "$OUT"
+        cd "$OUT"
+        
+        git clone --depth=1 https://github.com/august-aosp/AnyKernel3.git "$ANYKERNEL_DIR"
+
+        # 获取版本信息
+        TARGET_KERNEL_NAME=$(cat "../../$DEFCONFIG_FULL_PATH" | grep CONFIG_LOCALVERSION= | cut -d = -f 2 | sed 's/"//g' | sed 's/^-//')
+        TARGET_KERNEL_VERSION=$(make -C . -f "../../Makefile" kernelversion O="$OUT")
+        GIT_COMMIT=$(git rev-parse --short HEAD)
+
+        TARGET_PACKAGED_KERNEL_NAME="Kernel-${DEVICE}-${BUILD_VARIANT}-${GIT_COMMIT}.zip"
+        
+        # 复制文件到 AnyKernel3
+        TARGET_KERNEL_FILE="arch/arm64/boot/Image"
+        TARGET_KERNEL_DTBO="arch/arm64/boot/dtbo.img"
+        cp "../$TARGET_KERNEL_FILE" "$ANYKERNEL_DIR/Image"
+        cp "$TARGET_KERNEL_DTB" "$ANYKERNEL_DIR/"
+        if [ -f "$TARGET_KERNEL_DTBO" ]; then 
+          cp "$TARGET_KERNEL_DTBO" "$ANYKERNEL_DIR/"
+        fi
+
+        # 打包
+        cd "$ANYKERNEL_DIR"
+        zip -q -r "$TARGET_PACKAGED_KERNEL_NAME" *
+        cd ../..
+        echo "ZIP_FILENAME=$TARGET_PACKAGED_KERNEL_NAME" >> $GITHUB_ENV
+        
+    # 7. 生成 Release Tag
+    - name: Generate Release Tag
+      id: tag_gen
+      run: |
+        TAG_NAME="${{ inputs.device_code }}-${{ env.BUILD_VARIANT }}-$(date +'%Y%m%d-%H%M')"
+        echo "release_tag=$TAG_NAME" >> $GITHUB_OUTPUT
+
+    # 8. 上传到 Release
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v1
+      if: success()
+      with:
+        tag_name: ${{ steps.tag_gen.outputs.release_tag }}
+        name: ${{ inputs.device_code }} [${{ env.BUILD_VARIANT }}] Build ${{ steps.tag_gen.outputs.release_tag }}
+        body: |
+          Automated Build Details:
+          - Device: ${{ inputs.device_code }}
+          - Source Branch: ${{ inputs.kernel_source_branch || 'default' }}
+          - Toolchain: Latest Proton Clang
+          - LXC Patch: ${{ inputs.enable_lxc && 'Enabled' || 'Disabled' }}
+        files: workspace/../out/${{ inputs.device_code }}/${{ env.BUILD_VARIANT }}/AnyKernel3/${{ env.ZIP_FILENAME }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
