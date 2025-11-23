@@ -156,30 +156,34 @@ jobs:
         TARGET_KERNEL_DTB="arch/arm64/boot/dtb"
         TARGET_KERNEL_DTBO="arch/arm64/boot/dtbo.img"
         
-        # Clang & 编译参数 (注意：这里定义时保持为字符串)
+        # Clang & 编译参数 (新增 'CLANG_TRIPLE=aarch64-linux-gnu-' 作为通用参数)
         export PATH=$GITHUB_WORKSPACE/toolchain/clang/bin:$PATH
-        BUILD_ARGS="CC=clang ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 LD=ld.lld O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner"
+        
+        # 移除 BUILD_ARGS 中可能引起问题的参数，并确保 LTO 相关的 flags 不冲突
+        # 注意: KBUILD_CFLAGS += -Wno-unused-command-line-argument 用于消除 '--cuda-path' 警告（如果它在源码中硬编码）
+        # 这里使用 KBUILD_OVERRIDES 确保 Clang 参数优先
+        BUILD_ARGS="CC=clang ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 LD=ld.lld O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner KBUILD_CFLAGS+='-Wno-unused-command-line-argument'"
 
         # --- 1. 清理和配置 ---
         echo "--- 1. CLEANING AND CONFIGURING ---"
-        # 注意: clean/mrproper 只需要 -j$THREAD
-        make mrproper -j$THREAD
-        make clean -j$THREAD
+        # 使用 -s (silent mode) 来抑制 make 的 'Target not found' 警告
+        make -s mrproper -j$THREAD
+        make -s clean -j$THREAD
         rm -rf "$OUT"
         
         # 执行 Defconfig
-        # 核心修复点: 移除 $BUILD_ARGS 外面的引号，让 bash 展开为多个环境变量和参数
-        make $BUILD_ARGS "$DEFCONFIG_NAME" # <--- 修复: $BUILD_ARGS 不带引号
+        # 核心修复点: 移除 $BUILD_ARGS 外面的引号
+        make $BUILD_ARGS "$DEFCONFIG_NAME" 
 
         # --- 2. 编译内核 ---
         echo "--- 2. BUILDING KERNEL ---"
         # 核心修复点: 移除 $BUILD_ARGS 外面的引号
-        make $BUILD_ARGS # <--- 修复: $BUILD_ARGS 不带引号
+        make $BUILD_ARGS 
 
         # --- 3. 链接 DTB 文件 ---
         echo "--- 3. LINKING DTB FILES ---"
         # 核心修复点: 移除 $BUILD_ARGS 外面的引号
-        make $BUILD_ARGS dtbs # <--- 修复: $BUILD_ARGS 不带引号
+        make $BUILD_ARGS dtbs 
         find "$OUT/arch/arm64/boot/dts/vendor/qcom" -name '*.dtb' -exec cat {} + > "$OUT/$TARGET_KERNEL_DTB"
 
         # --- 4. 生成可刷写包 ---
@@ -219,7 +223,6 @@ jobs:
         cd "$ANYKERNEL_DIR"
         zip -q -r "$TARGET_PACKAGED_KERNEL_NAME.zip" *
         cd ../.. # 返回 workspace 根目录
-
     # 7. 生成 Release Tag
     - name: Generate Release Tag
       id: tag_gen
