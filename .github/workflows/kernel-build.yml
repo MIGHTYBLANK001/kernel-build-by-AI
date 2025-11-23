@@ -1,52 +1,53 @@
-name: Kernel Matrix Build (Vanilla & SUSFS)
+name: Kernel Build (Single Variant Select)
 
 on:
   workflow_dispatch:
     inputs:
+      # --- 核心配置 ---
       kernel_source_url:
-        description: '内核源码仓库地址 (Git URL)'
+        description: '内核源码仓库地址'
         required: true
-        default: 'https://github.com/User/repo.git'
+        default: ''
       kernel_source_branch:
-        description: '源码分支 (留空则使用默认分支)'
+        description: '源码分支 (留空默认)'
         required: false
         default: ''
       device_code:
-        description: '机型代码 (DEVICE, 例如 rosemary)'
+        description: '机型代码 (DEVICE)'
         required: true
-        default: 'rosemary'
+        default: ''
       defconfig_name:
-        description: 'Defconfig 路径 (例如 vendor/rosemary_defconfig)'
+        description: 'Defconfig 路径'
         required: true
-        default: 'vendor/rosemary_defconfig'
+        default: ''
+      
+      # --- 编译版本选择 (下拉菜单) ---
+      build_variant:
+        description: '选择编译版本'
+        required: true
+        type: choice
+        options:
+          - vanilla
+          - susfs
+        default: vanilla
+
+      # --- 功能开关 ---
       enable_lxc:
-        description: '是否启用 LXC/Docker 补丁?'
+        description: '启用 LXC/Docker 补丁?'
         required: true
         type: boolean
         default: true
 
 jobs:
-  build-kernel:
-    name: Build ${{ matrix.variant }}
+  # 只有一个 Job，根据下拉菜单的选择执行一次
+  build-selected-variant:
+    name: Build ${{ inputs.build_variant }}
     runs-on: ubuntu-latest
-    
-    # 策略矩阵：这会让同一个 Job 运行两次，变量 matrix.variant 分别为 vanilla 和 susfs
-    strategy:
-      fail-fast: false # 如果其中一个变体失败，不要取消另一个
-      matrix:
-        variant: [vanilla, susfs]
-
     permissions:
       contents: write
 
     steps:
-    # 1. 检出当前仓库 (为了获取 build.sh)
-    - name: Checkout Builder Repo
-      uses: actions/checkout@v4
-      with:
-        path: builder_tools
-
-    # 2. 初始化编译环境 (适配 ubuntu-latest)
+    # 1. 环境配置
     - name: Setup Build Environment
       run: |
         sudo apt-get update
@@ -56,38 +57,34 @@ jobs:
           libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
           squashfs-tools xsltproc zip zlib1g-dev python3 python3-pip wget unzip \
           lib32readline-dev lib32z1-dev liblz4-tool
-        
-        # 兼容性处理：ubuntu-latest (24.04) 可能移除了 python2，建立 python 软链接指向 python3
         sudo ln -sf /usr/bin/python3 /usr/bin/python
 
-    # 3. 下载 Neutron Clang (支持最新环境)
+    # 2. 下载工具链
     - name: Download Neutron Clang
       run: |
         mkdir -p toolchain
         cd toolchain
         git clone --depth=1 https://github.com/Neutron-Clang/neutron-clang.git clang
 
-    # 4. 克隆内核源码
+    # 3. 下载内核源码
     - name: Clone Kernel Source
       run: |
         URL="${{ inputs.kernel_source_url }}"
         BRANCH="${{ inputs.kernel_source_branch }}"
         if [ -z "$BRANCH" ]; then
-          echo "Cloning default branch..."
           git clone --depth=1 "$URL" workspace
         else
-          echo "Cloning branch $BRANCH..."
           git clone --depth=1 -b "$BRANCH" "$URL" workspace
         fi
 
-    # 5. 应用 LXC 补丁
+    # 4. 应用 LXC 补丁
     - name: Apply LXC patches
-      if: ${{ inputs.enable_lxc == 'true' }}
+      if: ${{ inputs.enable_lxc }}
       working-directory: workspace
       run: |
         set -e
-        echo "🔧 [${{ matrix.variant }}] 正在应用 LXC 补丁..."
-        
+        # 使用 inputs.build_variant 代替 matrix.variant
+        echo "🔧 [${{ inputs.build_variant }}] 正在应用 LXC 补丁..."
         LXC_URL="https://raw.githubusercontent.com/MIGHTYBLANK001/kernel-build-by-AI/refs/heads/main/Patchs/LXC_utils.zip"
         DEFCONFIG_FILE="arch/arm64/configs/${{ inputs.defconfig_name }}"
         
@@ -96,77 +93,160 @@ jobs:
 
         # 修改 Kconfig
         if [ -f "Kconfig" ]; then
-            ! grep -q 'source "utils/Kconfig"' Kconfig && echo 'source "utils/Kconfig"' >> Kconfig
+            if ! grep -q 'source "utils/Kconfig"' Kconfig; then
+                echo 'source "utils/Kconfig"' >> Kconfig
+            fi
         fi
 
         # 修改 Defconfig
         if [ -f "$DEFCONFIG_FILE" ]; then
-            ! grep -q '^CONFIG_DOCKER=y' "$DEFCONFIG_FILE" && echo "CONFIG_DOCKER=y" >> "$DEFCONFIG_FILE"
+            if ! grep -q '^CONFIG_DOCKER=y' "$DEFCONFIG_FILE"; then
+                echo "CONFIG_DOCKER=y" >> "$DEFCONFIG_FILE"
+            fi
             sed -i '/CONFIG_ANDROID_PARANOID_NETWORK/d' "$DEFCONFIG_FILE"
             echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> "$DEFCONFIG_FILE"
         else
-            echo "❌ 错误: 找不到 Defconfig 文件: $DEFCONFIG_FILE"
-            exit 1
+            echo "❌ 错误: 找不到 Defconfig: $DEFCONFIG_FILE"; exit 1
         fi
 
-        # 运行补丁脚本
         chmod +x utils/runcpatch.sh
         [[ -f kernel/cgroup/cgroup.c ]] && sh utils/runcpatch.sh kernel/cgroup/cgroup.c
         [[ -f kernel/cgroup.c ]] && sh utils/runcpatch.sh kernel/cgroup.c
         [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]] && patch -p0 < utils/xt_qtaguid.patch || true
-        echo "✅ LXC 补丁完成"
+        echo "✅ 补丁完成"
 
-    # 6. 准备构建脚本 (注入变量)
-    - name: Prepare Build Script
+    # 5. 生成 build.sh 脚本
+    - name: Generate Build Script
+      working-directory: workspace
       run: |
-        cp builder_tools/build.sh workspace/
-        cd workspace
+        cat << 'EOF' > build.sh
+        #!/usr/bin/env bash
+        source .env.sh
+        THREAD=$(nproc --all);
+        TARGET_KERNEL_FILE=arch/arm64/boot/Image;
+        TARGET_KERNEL_DTB=arch/arm64/boot/dtb;
+        TARGET_KERNEL_DTBO=arch/arm64/boot/dtbo.img
+        DEFCONFIG_PATH=arch/arm64/configs
+        DEFCONFIG_NAME="vendor/${DEVICE}_user_defconfig";
+        START_SEC=$(date +%s);
+        TARGET_KERNEL_NAME=$(cat $DEFCONFIG_PATH/$DEFCONFIG_NAME | grep CONFIG_LOCALVERSION= | cut -d = -f 2 | sed 's/"//g' | sed 's/^-//')
+        TARGET_KERNEL_VERSION=$(make kernelversion);
+        GIT_COMMIT=$(git rev-parse --short HEAD);
+        ANYKERNEL_PATH=AnyKernel3;
+
+        declare -A BUILD_VARIANTS_MAP=(
+            ["vanilla"]=""
+            ["susfs"]="vendor/kernelsu.config"
+            ["debug"]="vendor/debug.config"
+        )
+        BUILD_VARIANT="vanilla"
+
+        parse_args(){
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    -v|--variant)
+                    if [[ -n "${BUILD_VARIANTS_MAP[$2]}" || "$2" == "vanilla" ]]; then
+                        BUILD_VARIANT="$2"; shift 2
+                    else
+                        exit 1
+                    fi ;;
+                    *) shift 1 ;;
+                esac
+            done
+        }
+        parse_args "$@";
+
+        OUT="../out/$DEVICE/$BUILD_VARIANT"
+        build_args="CC=clang ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 LD=ld.lld O=$OUT -j$THREAD KBUILD_BUILD_USER=$BUILD_USER KBUILD_BUILD_HOST=$BUILD_HOST";
+        TARGET_PACKAGED_KERNEL_NAME=$TARGET_KERNEL_NAME-$TARGET_KERNEL_VERSION-$BUILD_VARIANT-$GIT_COMMIT;
+
+        link_all_dtb_files(){ find $OUT/arch/arm64/boot/dts/vendor/qcom -name '*.dtb' -exec cat {} + > $OUT/arch/arm64/boot/dtb; }
+
+        make_defconfig(){
+            echo " Building Kernel Defconfig.."
+            FRAGMENT="${BUILD_VARIANTS_MAP[$BUILD_VARIANT]}"
+            if [[ -n "$FRAGMENT" ]]; then
+                DEFCONFIG_NAME="$DEFCONFIG_NAME $FRAGMENT"
+            fi
+            make $build_args $DEFCONFIG_NAME;
+        }
+
+        build_kernel(){
+            echo " Building Kernel ...........";
+            make $build_args;
+        }
+
+        patch_kernel_properties(){
+            sed -i -e "s|\${KERNEL_STRING}|${KERNEL_STRING}|g" -e "s|\${DEVICE}|${DEVICE}|g" -e "s|\${SUPPORTED_VERSIONS}|${SUPPORTED_VERSIONS}|g" $ANYKERNEL_PATH/anykernel.sh;
+        }
+
+        generate_flashable(){
+            echo " Generating Flashable Kernel";
+            cd $OUT;
+            if [ ! -d $ANYKERNEL_PATH ]; then
+                git clone --depth=1 https://github.com/august-aosp/AnyKernel3.git $ANYKERNEL_PATH;
+                patch_kernel_properties;
+            fi
+            rm -rf $ANYKERNEL_PATH/$TARGET_KERNEL_NAME*;
+            cp -r $TARGET_KERNEL_FILE $ANYKERNEL_PATH/;
+            cp -r $TARGET_KERNEL_DTB $ANYKERNEL_PATH/;
+            if [ -f "$TARGET_KERNEL_DTBO" ]; then cp -r $TARGET_KERNEL_DTBO $ANYKERNEL_PATH/; fi
+            cd $ANYKERNEL_PATH;
+            zip -q -r $TARGET_PACKAGED_KERNEL_NAME.zip *;
+        }
+
+        clean(){
+            make mrproper -j$THREAD;
+            make clean -j$THREAD;
+            rm -rf $OUT;
+        }
+
+        main(){
+            clean; make_defconfig; build_kernel; link_all_dtb_files; generate_flashable;
+        }
+        main;
+        EOF
         chmod +x build.sh
+
+    # 6. 配置并执行构建
+    - name: Run Build (${{ inputs.build_variant }})
+      working-directory: workspace
+      run: |
+        export PATH=$GITHUB_WORKSPACE/toolchain/clang/bin:$PATH
         
-        # 动态替换 defconfig
         sed -i 's|DEFCONFIG_NAME="vendor/${DEVICE}_user_defconfig";|DEFCONFIG_NAME="${{ inputs.defconfig_name }}";|g' build.sh
         
-        # 生成 .env.sh
         echo "export DEVICE=${{ inputs.device_code }}" >> .env.sh
         echo "export BUILD_USER=GitHubAction" >> .env.sh
         echo "export BUILD_HOST=GitHub-Runner" >> .env.sh
-        # 在内核名称中加入变体标识 (例如 Rosemary-Kernel-susfs)
-        echo "export KERNEL_STRING=${{ inputs.device_code }}-Kernel-${{ matrix.variant }}" >> .env.sh
+        # 使用 inputs.build_variant
+        echo "export KERNEL_STRING=${{ inputs.device_code }}-${{ inputs.build_variant }}" >> .env.sh
+        echo "export SUPPORTED_VERSIONS=11,12,13,14,15" >> .env.sh
         chmod +x .env.sh
-
-    # 7. 执行构建 (使用 matrix.variant 动态传参)
-    - name: Run Build (${{ matrix.variant }})
-      run: |
-        export PATH=$GITHUB_WORKSPACE/toolchain/clang/bin:$PATH
-        cd workspace
         
-        # 这里使用了 ${{ matrix.variant }}，它会自动变为 vanilla 或 susfs
-        bash build.sh --variant ${{ matrix.variant }} cleanbuild
+        # 运行构建脚本 (传入选择的变体参数)
+        bash build.sh --variant ${{ inputs.build_variant }} cleanbuild
 
-    # 8. 生成独立的 Release Tag
+    # 7. 生成 Release Tag
     - name: Generate Release Tag
       id: tag_gen
       run: |
-        # 格式: 机型-变体-日期
-        echo "release_tag=${{ inputs.device_code }}-${{ matrix.variant }}-$(date +'%Y%m%d-%H%M')" >> $GITHUB_OUTPUT
+        # 使用 inputs.build_variant
+        echo "release_tag=${{ inputs.device_code }}-${{ inputs.build_variant }}-$(date +'%Y%m%d-%H%M')" >> $GITHUB_OUTPUT
 
-    # 9. 发布产物
+    # 8. 上传产物
     - name: Upload to Release
       uses: softprops/action-gh-release@v1
       if: success()
       with:
         tag_name: ${{ steps.tag_gen.outputs.release_tag }}
-        name: ${{ inputs.device_code }} [${{ matrix.variant }}] - $(date +'%Y%m%d')
+        # 使用 inputs.build_variant
+        name: ${{ inputs.device_code }} [${{ inputs.build_variant }}]
         body: |
-          ### Kernel Build Info
-          - **Variant:** ${{ matrix.variant }}
-          - **Device:** ${{ inputs.device_code }}
-          - **Source:** ${{ inputs.kernel_source_url }}
-          - **LXC Patch:** ${{ inputs.enable_lxc }}
-          - **System:** Ubuntu Latest
-          
-          Automated build via GitHub Actions.
-        files: |
-          workspace/AnyKernel3/*.zip
+          Automated Build
+          - Device: ${{ inputs.device_code }}
+          - Variant: ${{ inputs.build_variant }}
+          - LXC Patch: ${{ inputs.enable_lxc }}
+        files: workspace/AnyKernel3/*.zip
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
