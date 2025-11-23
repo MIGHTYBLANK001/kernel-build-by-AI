@@ -107,24 +107,7 @@ jobs:
         [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]] && patch -p0 < utils/xt_qtaguid.patch || true
         echo "✅ LXC 补丁应用完成"
 
-    # 5. 检查 LXC 补丁配置是否有效 (修复 HOSTLD 错误)
-    - name: Verify Docker/LXC requirements via moby check-config.sh
-      if: ${{ inputs.enable_lxc }}
-      working-directory: workspace
-      run: |
-        set -e
-        OUT_PATH="../out/${{ inputs.device_code }}/${{ env.BUILD_VARIANT }}"
-        echo "🔍 正在检查 LXC/Docker 依赖配置..."
-
-        # 【修复点 1】强制使用 HOSTCC=gcc 和 HOSTLD=ld 避免 Linker 冲突
-        make ${BUILD_ARGS_BASE} O=$OUT_PATH ${{ inputs.defconfig_name }} HOSTCC=gcc HOSTLD=ld
-        
-        curl -fsSL https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh -o /tmp/check-config.sh
-        chmod +x /tmp/check-config.sh
-        /tmp/check-config.sh $OUT_PATH/.config
-        echo "✅ 配置检查通过。"
-        
-    # 6. 编译内核，然后打包 (修复 HOSTLD 错误)
+    # 5. 编译内核，然后打包 (现在是第5步)
     - name: Build and Package Kernel (Vanilla)
       working-directory: workspace
       run: |
@@ -139,7 +122,7 @@ jobs:
         ANYKERNEL_DIR="AnyKernel3"
         DEFCONFIG_FULL_PATH="arch/arm64/configs/$DEFCONFIG_NAME"
         
-        # 编译参数: 包含 HOSTCC=gcc, HOSTLD=ld, HOSTLDFLAGS='' (防止 Linker 干扰)
+        # 编译参数: 包含 HOSTCC=gcc, HOSTLD=ld, HOSTLDFLAGS='' (修复 Linker 冲突)
         BUILD_ARGS="$BUILD_ARGS_BASE O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner KBUILD_CFLAGS+='-Wno-unused-command-line-argument' HOSTCC=gcc HOSTLD=ld HOSTLDFLAGS=''" 
 
         # --- 1. 清理和配置 ---
@@ -154,6 +137,7 @@ jobs:
         
         # --- 2. 核心编译：编译 Image 和所有 DTBs ---
         echo "--- 2. BUILDING KERNEL IMAGE AND DTBS ---"
+        # 核心编译
         make $BUILD_ARGS Image dtbs 
 
         # --- 3. 链接 DTB 文件 (通用兼容模式) ---
@@ -191,14 +175,14 @@ jobs:
         cd ../..
         echo "ZIP_FILENAME=$TARGET_PACKAGED_KERNEL_NAME" >> $GITHUB_ENV
         
-    # 7. 生成 Release Tag
+    # 6. 生成 Release Tag (现在是第6步)
     - name: Generate Release Tag
       id: tag_gen
       run: |
         TAG_NAME="${{ inputs.device_code }}-${{ env.BUILD_VARIANT }}-$(date +'%Y%m%d-%H%M')"
         echo "release_tag=$TAG_NAME" >> $GITHUB_OUTPUT
 
-    # 8. 上传到 Release
+    # 7. 上传到 Release (现在是第7步)
     - name: Upload to Release
       uses: softprops/action-gh-release@v1
       if: success()
