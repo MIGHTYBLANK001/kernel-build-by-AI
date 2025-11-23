@@ -121,15 +121,16 @@ jobs:
         OUT="../out/$DEVICE/$BUILD_VARIANT"
         ANYKERNEL_DIR="AnyKernel3"
         DEFCONFIG_FULL_PATH="arch/arm64/configs/$DEFCONFIG_NAME"
-        
-        # 编译参数: 包含 HOSTCC=gcc, HOSTLD=ld, HOSTLDFLAGS='' (修复 Linker 冲突)
-        BUILD_ARGS="$BUILD_ARGS_BASE O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner KBUILD_CFLAGS+='-Wno-unused-command-line-argument' HOSTCC=gcc HOSTLD=ld HOSTLDFLAGS=''" 
 
-        # --- 1. 清理和配置 (核心修复点) ---
-        echo "--- 1. CLEANING AND CONFIGURING ---"
-        # 【最终修复】显式传递 HOSTCC, HOSTLD, HOSTLDFLAGS='', HOSTCFLAGS='-O2' 以确保 Host 工具编译环境干净
+        # 【核心修复变量】确保 HOST 编译环境干净
         HOST_BUILD_VARS="HOSTCC=gcc HOSTLD=ld HOSTLDFLAGS='' HOSTCFLAGS='-O2'"
 
+        # 编译参数: 包含 HOST 变量和交叉编译变量
+        BUILD_ARGS="$BUILD_ARGS_BASE O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner KBUILD_CFLAGS+='-Wno-unused-command-line-argument' $HOST_BUILD_VARS" 
+
+        # --- 1. 清理和配置 ---
+        echo "--- 1. CLEANING AND CONFIGURING ---"
+        # 清理命令也必须包含 HOST 变量
         make -s mrproper -j$THREAD $HOST_BUILD_VARS
         make -s clean -j$THREAD $HOST_BUILD_VARS
         rm -rf "$OUT"
