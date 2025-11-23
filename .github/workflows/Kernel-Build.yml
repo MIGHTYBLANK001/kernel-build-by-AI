@@ -13,11 +13,11 @@ on:
         required: false
       device_code:
         description: "目标设备代码 (如 lmi)"
-        default: "lmi"
+        default: ""
         required: true
       defconfig_sub_path:
         description: "Defconfig 文件相对于 arch/arm64/configs/ 的子路径 (如 lmi_defconfig 或 vendor/lmi_defconfig)"
-        default: "lmi_defconfig"
+        default: ""
         required: true
       enable_lxc_patch:
         description: "是否应用 LXC/Docker 补丁"
