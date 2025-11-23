@@ -107,7 +107,7 @@ jobs:
         [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]] && patch -p0 < utils/xt_qtaguid.patch || true
         echo "✅ LXC 补丁应用完成"
 
-    # 5. 编译内核，然后打包 (现在是第5步)
+    # 5. 编译内核，然后打包
     - name: Build and Package Kernel (Vanilla)
       working-directory: workspace
       run: |
@@ -125,11 +125,13 @@ jobs:
         # 编译参数: 包含 HOSTCC=gcc, HOSTLD=ld, HOSTLDFLAGS='' (修复 Linker 冲突)
         BUILD_ARGS="$BUILD_ARGS_BASE O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner KBUILD_CFLAGS+='-Wno-unused-command-line-argument' HOSTCC=gcc HOSTLD=ld HOSTLDFLAGS=''" 
 
-        # --- 1. 清理和配置 ---
+        # --- 1. 清理和配置 (核心修复点) ---
         echo "--- 1. CLEANING AND CONFIGURING ---"
-        # 清理命令也必须包含 HOSTCC/HOSTLD
-        make -s mrproper -j$THREAD HOSTCC=gcc HOSTLD=ld
-        make -s clean -j$THREAD HOSTCC=gcc HOSTLD=ld
+        # 【最终修复】显式传递 HOSTCC, HOSTLD, HOSTLDFLAGS='', HOSTCFLAGS='-O2' 以确保 Host 工具编译环境干净
+        HOST_BUILD_VARS="HOSTCC=gcc HOSTLD=ld HOSTLDFLAGS='' HOSTCFLAGS='-O2'"
+
+        make -s mrproper -j$THREAD $HOST_BUILD_VARS
+        make -s clean -j$THREAD $HOST_BUILD_VARS
         rm -rf "$OUT"
         
         # 执行 Defconfig
@@ -137,7 +139,6 @@ jobs:
         
         # --- 2. 核心编译：编译 Image 和所有 DTBs ---
         echo "--- 2. BUILDING KERNEL IMAGE AND DTBS ---"
-        # 核心编译
         make $BUILD_ARGS Image dtbs 
 
         # --- 3. 链接 DTB 文件 (通用兼容模式) ---
@@ -175,14 +176,14 @@ jobs:
         cd ../..
         echo "ZIP_FILENAME=$TARGET_PACKAGED_KERNEL_NAME" >> $GITHUB_ENV
         
-    # 6. 生成 Release Tag (现在是第6步)
+    # 6. 生成 Release Tag
     - name: Generate Release Tag
       id: tag_gen
       run: |
         TAG_NAME="${{ inputs.device_code }}-${{ env.BUILD_VARIANT }}-$(date +'%Y%m%d-%H%M')"
         echo "release_tag=$TAG_NAME" >> $GITHUB_OUTPUT
 
-    # 7. 上传到 Release (现在是第7步)
+    # 7. 上传到 Release
     - name: Upload to Release
       uses: softprops/action-gh-release@v1
       if: success()
