@@ -1,4 +1,4 @@
-name: Kernel Build (Vanilla Only & Stable Google Toolchain)
+name: Kernel Build (Vanilla Only & Proton Clang Toolchain)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
       kernel_source_url:
         description: '内核源码仓库地址'
         required: true
-        default: '' # 默认为空
+        default: ''
       kernel_source_branch:
         description: '源码分支 (留空默认)'
         required: false
@@ -15,11 +15,11 @@ on:
       device_code:
         description: '机型代码 (DEVICE)'
         required: true
-        default: '' # 默认为空
+        default: ''
       defconfig_name:
         description: 'Defconfig 路径 (例如 vendor/rosemary_defconfig)'
         required: true
-        default: '' # 默认为空
+        default: ''
       
       # --- 功能开关 ---
       enable_lxc:
@@ -37,6 +37,12 @@ jobs:
       
     env:
       BUILD_VARIANT: vanilla
+      # 【更新】定义 Proton Clang 路径和版本（使用 $HOME 路径）
+      PROTON_CLANG_VERSION: 20210522
+      # TOOLCHAIN_DIR 定义为克隆的根目录
+      TOOLCHAIN_DIR_ROOT: $HOME/proton-clang
+      # TOOLCHAIN_PATH 定义为 bin 目录，供后续 PATH 变量使用
+      TOOLCHAIN_PATH: $HOME/proton-clang/proton-clang-20210522/bin
 
     steps:
     # 1. 环境配置
@@ -51,44 +57,30 @@ jobs:
           lib32readline-dev lib32z1-dev liblz4-tool jq
         sudo ln -sf /usr/bin/python3 /usr/bin/python
 
-# 2. 【已修复】下载 Google 官方工具链 (使用稳定 AOSP Clang Git 镜像并强制认证)
-    - name: Download Official Google Toolchains (Stable AOSP Clang)
+    # 2. 【精确更新】下载 Proton Clang 20210522
+    - name: Download Proton Clang Toolchain (20210522)
       run: |
         set -e
-        TOOLCHAIN_DIR="$GITHUB_WORKSPACE/toolchain"
-        mkdir -p "$TOOLCHAIN_DIR"
+        CLANG_REPO="https://github.com/kdrag0n/proton-clang"
         
-        # A. 下载稳定 AOSP Clang (r498227b 对应 LLVM 17)
-        CLANG_REPO="https://github.com/kdrag0n/aosp-clang"
-        CLANG_VERSION="r498227b" 
-        CLANG_TARGET="$TOOLCHAIN_DIR/aosp-clang"
+        echo "➡️ 克隆 Proton Clang 版本: ${PROTON_CLANG_VERSION}"
         
-        echo "⚠️ 修复 Git 认证错误：使用 GITHUB_TOKEN 强制通过 HTTPS 克隆稳定 AOSP Clang 版本: ${CLANG_VERSION}"
+        # 创建 $HOME/proton-clang 目录
+        mkdir -p "$TOOLCHAIN_DIR_ROOT"
         
-        # 构建带有 GITHUB_TOKEN 的 URL，解决 'could not read Username' 错误
-        CLANG_AUTH_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/kdrag0n/aosp-clang.git"
-        
-        # 尝试使用带认证的 HTTPS 协议克隆
-        git clone --depth=1 "$CLANG_AUTH_URL" "$CLANG_TARGET" -b "$CLANG_VERSION"
+        # 克隆到 $HOME/proton-clang/proton-clang-20210522 目录
+        git clone --depth=1 --branch "$PROTON_CLANG_VERSION" "$CLANG_REPO" \
+          "$TOOLCHAIN_DIR_ROOT/proton-clang-$PROTON_CLANG_VERSION"
         
         if [ $? -ne 0 ]; then
-            echo "❌ 错误: AOSP Clang 克隆失败。请检查 GITHUB_TOKEN 权限或仓库状态。"
+            echo "❌ 错误: Proton Clang 克隆失败。请检查分支名称或网络状态。"
             exit 1
         fi
-        
-        # B. 下载 Google GNU Binutils/GCC (保持不变)
-        GNU_URL="https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9/archive/refs/heads/master.tar.gz"
-        GNU_DIR="$TOOLCHAIN_DIR/gcc-aarch64"
-        mkdir -p "$GNU_DIR"
-        echo "Downloading AOSP GNU Toolchain..."
-        
-        wget "$GNU_URL" -O "$TOOLCHAIN_DIR/gcc-aarch64.tar.gz"
-        if [ $? -ne 0 ]; then echo "❌ 错误: GNU Toolchain 下载失败。"; exit 1; fi
-        
-        tar -xf "$TOOLCHAIN_DIR/gcc-aarch64.tar.gz" -C "$GNU_DIR" --strip-components=1
-        
-        echo "✅ Google 官方工具链下载并解压完毕。"
 
+        # 【重要】设置 PATH 环境变量到 Clang 的 bin 目录
+        echo "PATH=${TOOLCHAIN_PATH}:$PATH" >> $GITHUB_ENV
+        echo "✅ Proton Clang 工具链下载并设置 PATH 完毕。"
+        
     # 3. 下载内核源码
     - name: Clone Kernel Source
       run: |
@@ -160,7 +152,7 @@ jobs:
         [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]] && patch -p0 < utils/xt_qtaguid.patch || true
         echo "✅ LXC 补丁应用完成"
 
-    # 6. 核心编译和打包逻辑 (路径已适配新的工具链结构)
+    # 6. 核心编译和打包逻辑
     - name: Build and Package Kernel (Vanilla)
       working-directory: workspace
       run: |
@@ -182,13 +174,8 @@ jobs:
         TARGET_KERNEL_DTB="arch/arm64/boot/dtb"
         TARGET_KERNEL_DTBO="arch/arm64/boot/dtbo.img"
         
-        # 路径设置：新的 AOSP Clang 路径和 GNU GCC 路径
-        CLANG_BIN_PATH="$GITHUB_WORKSPACE/toolchain/aosp-clang/bin"
-        GNU_BIN_PATH="$GITHUB_WORKSPACE/toolchain/gcc-aarch64/bin"
-        export PATH=$CLANG_BIN_PATH:$GNU_BIN_PATH:$PATH
-        
-        # 编译参数
-        BUILD_ARGS="CC=clang ARCH=arm64 CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 LD=ld.lld O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner KBUILD_CFLAGS+='-Wno-unused-command-line-argument'"
+        # 编译参数：使用 aarch64-linux-gnu- 前缀
+        BUILD_ARGS="CC=clang ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 LD=ld.lld O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner KBUILD_CFLAGS+='-Wno-unused-command-line-argument'"
 
         # --- 1. 清理和配置 ---
         echo "--- 1. CLEANING AND CONFIGURING ---"
@@ -216,8 +203,8 @@ jobs:
         git clone --depth=1 https://github.com/august-aosp/AnyKernel3.git "$ANYKERNEL_DIR"
 
         # 获取版本信息
-        TARGET_KERNEL_NAME=$(cat "../$DEFCONFIG_FULL_PATH" | grep CONFIG_LOCALVERSION= | cut -d = -f 2 | sed 's/"//g' | sed 's/^-//')
-        TARGET_KERNEL_VERSION=$(make -C . -f "../Makefile" kernelversion O="$OUT")
+        TARGET_KERNEL_NAME=$(cat "../../$DEFCONFIG_FULL_PATH" | grep CONFIG_LOCALVERSION= | cut -d = -f 2 | sed 's/"//g' | sed 's/^-//')
+        TARGET_KERNEL_VERSION=$(make -C . -f "../../Makefile" kernelversion O="$OUT")
         GIT_COMMIT=$(git rev-parse --short HEAD)
 
         TARGET_PACKAGED_KERNEL_NAME="$TARGET_KERNEL_NAME-$TARGET_KERNEL_VERSION-$BUILD_VARIANT-$GIT_COMMIT"
@@ -233,7 +220,7 @@ jobs:
           "$ANYKERNEL_DIR/anykernel.sh"
         
         # 复制文件
-        cp "$TARGET_KERNEL_FILE" "$ANYKERNEL_DIR/"
+        cp "../$TARGET_KERNEL_FILE" "$ANYKERNEL_DIR/Image"
         cp "$TARGET_KERNEL_DTB" "$ANYKERNEL_DIR/"
         if [ -f "$TARGET_KERNEL_DTBO" ]; then 
           cp "$TARGET_KERNEL_DTBO" "$ANYKERNEL_DIR/"
