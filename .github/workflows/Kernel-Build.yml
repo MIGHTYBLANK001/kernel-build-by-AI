@@ -4,8 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       kernel_repo:
-        description: "目标内核源码仓库（owner/repo）"
-        default: ""
+        # 🚀 输入描述已更新，要求输入完整仓库地址
+        description: "目标内核源码仓库的完整 HTTPS 地址"
+        # 🚀 新的默认仓库链接 (完整 URL)
+        default: "https://github.com/liyafe1997/kernel_xiaomi_sm8250_mod"
         required: true
       kernel_branch:
         description: "要构建的分支；留空则使用仓库默认分支"
@@ -13,16 +15,16 @@ on:
         required: false
       device_code:
         description: "目标设备代码 (如 lmi)"
-        default: ""
+        default: "lmi"
         required: true
       defconfig_sub_path:
         description: "Defconfig 文件相对于 arch/arm64/configs/ 的子路径 (如 lmi_defconfig 或 vendor/lmi_defconfig)"
-        default: ""
+        default: "lmi_defconfig"
         required: true
       enable_lxc_patch:
         description: "是否应用 LXC/Docker 补丁"
         type: boolean
-        default: false
+        default: true
         required: true
 
 permissions:
@@ -34,10 +36,8 @@ jobs:
 
     env:
       TARGET_DEVICE: ${{ inputs.device_code }}
-      # DEFCONFIG 路径基础已硬编码
       DEFCONFIG_SUB_PATH: ${{ inputs.defconfig_sub_path }}
       BUILD_AOSP: "1"
-      # MAKE_ARGS 依赖于后续 Toolchain 步骤设置的 PATH
       MAKE_ARGS: "ARCH=arm64 SUBARCH=arm64 O=out CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
 
     steps:
@@ -46,18 +46,31 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 计算安全的仓库短名、分支名和当前时间
+      # 🚀 新增逻辑：解析 URL，计算安全的仓库名和时间戳
       - name: Prepare safe names and timestamp
         id: names
         shell: bash
         run: |
           set -e
-          KREPO="${{ inputs.kernel_repo }}"
+          KREPO_URL="${{ inputs.kernel_repo }}"
           KBRANCH="${{ inputs.kernel_branch }}"
-          SAFE_REPO="$(echo "${KREPO}" | sed 's#/#-#g')"
+          
+          # 解析 URL，提取 owner/repo 格式
+          # 1. 去除协议头 (http:// 或 https://)
+          URL_NO_PROTOCOL=$(echo "$KREPO_URL" | sed 's|^https\?://||')
+          # 2. 去除域名 (github.com 或其他)
+          REPO_OWNER_NAME=$(echo "$URL_NO_PROTOCOL" | sed 's|^[^/]\+/||')
+          # 3. 去除可能的 .git 后缀
+          REPO_OWNER_NAME=$(echo "$REPO_OWNER_NAME" | sed 's/\.git$//')
+          
+          KERNEL_REPO_PATH="$REPO_OWNER_NAME"
+          
+          # 用于 Artifacts 和 ZIP 文件名的安全名称
+          SAFE_REPO="$(echo "${KERNEL_REPO_PATH}" | sed 's#/#-#g')"
           [[ -z "${KBRANCH}" ]] && KBRANCH="default"
           CURRENT_TIME="$(date +%Y%m%d%H%M)"
           
+          echo "kernel_repo_path=${KERNEL_REPO_PATH}" >> $GITHUB_OUTPUT 
           echo "safe_repo=${SAFE_REPO}" >> $GITHUB_OUTPUT
           echo "safe_branch=${KBRANCH}" >> $GITHUB_OUTPUT
           echo "current_time=${CURRENT_TIME}" >> $GITHUB_OUTPUT
@@ -66,7 +79,8 @@ jobs:
       - name: Checkout target kernel repo to kernel-src
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.kernel_repo }}
+          # 🚀 使用解析出的 owner/repo 路径
+          repository: ${{ steps.names.outputs.kernel_repo_path }}
           ref: ${{ inputs.kernel_branch }}
           path: kernel-src
           submodules: recursive
@@ -83,7 +97,6 @@ jobs:
 
       - name: 🛠️ Fetch Latest Proton Clang (Toolchain)
         run: |
-          # 克隆最新稳定版 Proton Clang 并配置 PATH
           git clone --depth=1 https://github.com/kdrag0n/proton-clang $HOME/proton-clang
           TOOLCHAIN_PATH=$HOME/proton-clang/bin
           echo "PATH=$TOOLCHAIN_PATH:$PATH" >> $GITHUB_ENV
