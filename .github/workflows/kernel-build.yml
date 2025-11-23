@@ -1,4 +1,4 @@
-name: Kernel Build (Vanilla Only & Cleanup)
+name: Kernel Build (Vanilla Only & Google Toolchain)
 
 on:
   workflow_dispatch:
@@ -35,7 +35,6 @@ jobs:
     permissions:
       contents: write
       
-    # 内部固定 variant 为 vanilla
     env:
       BUILD_VARIANT: vanilla
 
@@ -52,12 +51,30 @@ jobs:
           lib32readline-dev lib32z1-dev liblz4-tool
         sudo ln -sf /usr/bin/python3 /usr/bin/python
 
-    # 2. 下载工具链
-    - name: Download Neutron Clang
+    # 2. 【已修改】下载 Google 官方 LLVM/Clang 和 GNU 工具链 (AOSP Prebuilts)
+    - name: Download Official Google Toolchains
       run: |
-        mkdir -p toolchain
-        cd toolchain
-        git clone --depth=1 https://github.com/Neutron-Clang/neutron-clang.git clang
+        TOOLCHAIN_DIR="$GITHUB_WORKSPACE/toolchain"
+        mkdir -p "$TOOLCHAIN_DIR"
+        
+        # A. 下载 Google LLVM/Clang (使用 LLVM 17.0.6 官方发布版本)
+        CLANG_VERSION="17.0.6"
+        CLANG_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${CLANG_VERSION}/clang+llvm-${CLANG_VERSION}-x86_64-linux-gnu.tar.xz"
+        echo "Downloading Clang ${CLANG_VERSION}..."
+        wget -q "$CLANG_URL" -O "$TOOLCHAIN_DIR/clang.tar.xz"
+        # 解压到 toolchain/bin (注意：--strip-components=1 保持干净的结构)
+        tar -xf "$TOOLCHAIN_DIR/clang.tar.xz" -C "$TOOLCHAIN_DIR" --strip-components=1
+
+        # B. 下载 Google GNU Binutils/GCC (AOSP aarch64-linux-android-4.9)
+        # 兼容旧内核或需要 aarch64-linux-android- 链接器的环境
+        GNU_URL="https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9/archive/refs/heads/master.tar.gz"
+        GNU_DIR="$TOOLCHAIN_DIR/gcc-aarch64"
+        mkdir -p "$GNU_DIR"
+        echo "Downloading AOSP GNU Toolchain..."
+        wget -q "$GNU_URL" -O "$TOOLCHAIN_DIR/gcc-aarch64.tar.gz"
+        tar -xf "$TOOLCHAIN_DIR/gcc-aarch64.tar.gz" -C "$GNU_DIR" --strip-components=1
+        
+        echo "✅ Google 官方工具链下载并解压完毕。"
 
     # 3. 下载内核源码
     - name: Clone Kernel Source
@@ -70,7 +87,7 @@ jobs:
           git clone --depth=1 -b "$BRANCH" "$URL" workspace
         fi
 
-    # 4. 【新增】KernelSU 配置清理 (防止 Kconfig 找不到文件错误)
+    # 4. KernelSU 配置清理
     - name: Cleanup KernelSU Configuration References
       working-directory: workspace
       run: |
@@ -80,18 +97,14 @@ jobs:
         
         echo "🔍 正在清理 KernelSU 配置引用..."
         
-        # 1. 清理 drivers/Kconfig 中的 source 引用
         if [ -f "$KCONFIG_FILE" ]; then
-          # 查找包含 'kernelsu' 的 source 引用，并将其注释掉
           sed -i '/kernelsu/s/^/# &/' "$KCONFIG_FILE"
           echo "✅ drivers/Kconfig 清理完成。"
         else
           echo "⚠️ drivers/Kconfig 文件不存在，跳过清理。"
         fi
         
-        # 2. 清理 defconfig 文件中的配置项
         if [ -f "$DEFCONFIG_FILE" ]; then
-          # 查找并删除 CONFIG_KSU 相关的行
           sed -i '/CONFIG_KSU/d' "$DEFCONFIG_FILE"
           echo "✅ Defconfig 中的 CONFIG_KSU 项已删除。"
         else
@@ -134,16 +147,16 @@ jobs:
         [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]] && patch -p0 < utils/xt_qtaguid.patch || true
         echo "✅ LXC 补丁应用完成"
 
-    # 6. 核心编译和打包逻辑
+    # 6. 【已优化】核心编译和打包逻辑 (编译 Image 和 DTBs)
     - name: Build and Package Kernel (Vanilla)
       working-directory: workspace
       run: |
-        set -e # 任何命令失败都立即退出
+        set -e
         
         # --- 变量定义 ---
         DEVICE="${{ inputs.device_code }}"
         DEFCONFIG_NAME="${{ inputs.defconfig_name }}"
-        BUILD_VARIANT="${{ env.BUILD_VARIANT }}" # vanilla
+        BUILD_VARIANT="${{ env.BUILD_VARIANT }}"
         THREAD=$(nproc --all)
         
         # 路径定义
@@ -151,39 +164,36 @@ jobs:
         ANYKERNEL_DIR="AnyKernel3"
         DEFCONFIG_FULL_PATH="arch/arm64/configs/$DEFCONFIG_NAME"
         
-        # 目标文件定义 (相对 O=$OUT 目录)
+        # 目标文件定义
         TARGET_KERNEL_FILE="arch/arm64/boot/Image"
         TARGET_KERNEL_DTB="arch/arm64/boot/dtb"
         TARGET_KERNEL_DTBO="arch/arm64/boot/dtbo.img"
         
-        # Clang & 编译参数 (新增 'CLANG_TRIPLE=aarch64-linux-gnu-' 作为通用参数)
-        export PATH=$GITHUB_WORKSPACE/toolchain/clang/bin:$PATH
+        # 路径设置
+        CLANG_BIN_PATH="$GITHUB_WORKSPACE/toolchain/bin"
+        GNU_BIN_PATH="$GITHUB_WORKSPACE/toolchain/gcc-aarch64/bin"
+        export PATH=$CLANG_BIN_PATH:$GNU_BIN_PATH:$PATH
         
-        # 移除 BUILD_ARGS 中可能引起问题的参数，并确保 LTO 相关的 flags 不冲突
-        # 注意: KBUILD_CFLAGS += -Wno-unused-command-line-argument 用于消除 '--cuda-path' 警告（如果它在源码中硬编码）
-        # 这里使用 KBUILD_OVERRIDES 确保 Clang 参数优先
-        BUILD_ARGS="CC=clang ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 LD=ld.lld O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner KBUILD_CFLAGS+='-Wno-unused-command-line-argument'"
+        # 编译参数
+        BUILD_ARGS="CC=clang ARCH=arm64 CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 LD=ld.lld O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner KBUILD_CFLAGS+='-Wno-unused-command-line-argument'"
 
         # --- 1. 清理和配置 ---
         echo "--- 1. CLEANING AND CONFIGURING ---"
-        # 使用 -s (silent mode) 来抑制 make 的 'Target not found' 警告
         make -s mrproper -j$THREAD
         make -s clean -j$THREAD
         rm -rf "$OUT"
         
         # 执行 Defconfig
-        # 核心修复点: 移除 $BUILD_ARGS 外面的引号
         make $BUILD_ARGS "$DEFCONFIG_NAME" 
 
-        # --- 2. 编译内核 ---
-        echo "--- 2. BUILDING KERNEL ---"
-        # 核心修复点: 移除 $BUILD_ARGS 外面的引号
-        make $BUILD_ARGS 
+        # --- 2. 【核心编译】编译 Image 和所有 DTBs ---
+        echo "--- 2. BUILDING KERNEL IMAGE AND DTBS ---"
+        # 明确指定 Image 和 dtbs 目标，确保一次性完成所有必要文件
+        make $BUILD_ARGS Image dtbs 
 
-        # --- 3. 链接 DTB 文件 ---
+        # --- 3. 【链接】链接 DTB 文件 ---
         echo "--- 3. LINKING DTB FILES ---"
-        # 核心修复点: 移除 $BUILD_ARGS 外面的引号
-        make $BUILD_ARGS dtbs 
+        # 仅执行合并操作
         find "$OUT/arch/arm64/boot/dts/vendor/qcom" -name '*.dtb' -exec cat {} + > "$OUT/$TARGET_KERNEL_DTB"
 
         # --- 4. 生成可刷写包 ---
@@ -192,7 +202,6 @@ jobs:
         mkdir -p "$OUT"
         cd "$OUT"
         
-        # 克隆 AnyKernel3
         git clone --depth=1 https://github.com/august-aosp/AnyKernel3.git "$ANYKERNEL_DIR"
 
         # 获取版本信息
@@ -222,7 +231,8 @@ jobs:
         # 打包
         cd "$ANYKERNEL_DIR"
         zip -q -r "$TARGET_PACKAGED_KERNEL_NAME.zip" *
-        cd ../.. # 返回 workspace 根目录
+        cd ../..
+
     # 7. 生成 Release Tag
     - name: Generate Release Tag
       id: tag_gen
