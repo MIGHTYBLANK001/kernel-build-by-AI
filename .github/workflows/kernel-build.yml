@@ -156,26 +156,30 @@ jobs:
         TARGET_KERNEL_DTB="arch/arm64/boot/dtb"
         TARGET_KERNEL_DTBO="arch/arm64/boot/dtbo.img"
         
-        # Clang & 编译参数 (多线程 -j$THREAD 已包含)
+        # Clang & 编译参数 (注意：这里定义时保持为字符串)
         export PATH=$GITHUB_WORKSPACE/toolchain/clang/bin:$PATH
         BUILD_ARGS="CC=clang ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 LD=ld.lld O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner"
 
         # --- 1. 清理和配置 ---
         echo "--- 1. CLEANING AND CONFIGURING ---"
+        # 注意: clean/mrproper 只需要 -j$THREAD
         make mrproper -j$THREAD
         make clean -j$THREAD
         rm -rf "$OUT"
         
-        # 执行 Defconfig (没有额外的 KSU 配置片段)
-        make "$BUILD_ARGS" "$DEFCONFIG_NAME"
+        # 执行 Defconfig
+        # 核心修复点: 移除 $BUILD_ARGS 外面的引号，让 bash 展开为多个环境变量和参数
+        make $BUILD_ARGS "$DEFCONFIG_NAME" # <--- 修复: $BUILD_ARGS 不带引号
 
         # --- 2. 编译内核 ---
         echo "--- 2. BUILDING KERNEL ---"
-        make "$BUILD_ARGS"
+        # 核心修复点: 移除 $BUILD_ARGS 外面的引号
+        make $BUILD_ARGS # <--- 修复: $BUILD_ARGS 不带引号
 
         # --- 3. 链接 DTB 文件 ---
         echo "--- 3. LINKING DTB FILES ---"
-        make "$BUILD_ARGS" dtbs
+        # 核心修复点: 移除 $BUILD_ARGS 外面的引号
+        make $BUILD_ARGS dtbs # <--- 修复: $BUILD_ARGS 不带引号
         find "$OUT/arch/arm64/boot/dts/vendor/qcom" -name '*.dtb' -exec cat {} + > "$OUT/$TARGET_KERNEL_DTB"
 
         # --- 4. 生成可刷写包 ---
