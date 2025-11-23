@@ -51,7 +51,7 @@ jobs:
           lib32readline-dev lib32z1-dev liblz4-tool jq
         sudo ln -sf /usr/bin/python3 /usr/bin/python
 
-    # 2. 【已修复】下载 Google 官方工具链 (使用稳定 AOSP Clang Git 镜像)
+# 2. 【已修复】下载 Google 官方工具链 (使用稳定 AOSP Clang Git 镜像)
     - name: Download Official Google Toolchains (Stable AOSP Clang)
       run: |
         set -e
@@ -59,15 +59,22 @@ jobs:
         mkdir -p "$TOOLCHAIN_DIR"
         
         # A. 下载稳定 AOSP Clang (r498227b 对应 LLVM 17)
+        # 修复：将 HTTPS 协议替换为更稳定的 GIT 协议，避免认证错误 (fatal: could not read Username)
         CLANG_REPO="https://github.com/kdrag0n/aosp-clang"
+        CLANG_GIT_URL="git://github.com/kdrag0n/aosp-clang.git" # <-- 使用 GIT 协议
         CLANG_VERSION="r498227b" 
         CLANG_TARGET="$TOOLCHAIN_DIR/aosp-clang"
         
-        echo "⚠️ 修复 404 错误：切换到已知的稳定 AOSP Clang 版本: ${CLANG_VERSION}"
-        git clone --depth=1 "$CLANG_REPO" "$CLANG_TARGET" -b "$CLANG_VERSION"
+        echo "⚠️ 修复 Git 认证错误：切换到 GIT 协议克隆稳定 AOSP Clang 版本: ${CLANG_VERSION}"
+        # 尝试使用 GIT 协议克隆
+        git clone --depth=1 "$CLANG_GIT_URL" "$CLANG_TARGET" -b "$CLANG_VERSION" || \
+        {
+          echo "⚠️ GIT 协议克隆失败，尝试使用 HTTPS..."
+          git clone --depth=1 "$CLANG_REPO" "$CLANG_TARGET" -b "$CLANG_VERSION"
+        }
         
         if [ $? -ne 0 ]; then
-            echo "❌ 错误: AOSP Clang 克隆失败。请检查仓库状态。"
+            echo "❌ 错误: AOSP Clang 克隆失败。请检查仓库状态或网络连接。"
             exit 1
         fi
         
