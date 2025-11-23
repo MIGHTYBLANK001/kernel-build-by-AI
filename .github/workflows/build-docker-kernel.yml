@@ -1,5 +1,5 @@
 
-name: Build kernel (lmi/AOSP) – expanded workflow + release
+name: Build kernel (AOSP) – expanded workflow + release
 
 on:
   workflow_dispatch:
