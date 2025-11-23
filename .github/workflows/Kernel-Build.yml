@@ -38,10 +38,11 @@ jobs:
     env:
       BUILD_VARIANT: vanilla
       TOOLCHAIN_CLONE_DIR: ${{ github.workspace }}/toolchain/proton-clang
+      # 通用编译参数：使用 LLVM/Clang 进行交叉编译
       BUILD_ARGS_BASE: "CC=clang ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1"
 
     steps:
-    # 1. 环境配置与依赖安装 (已修复 imagemagick 拼写错误)
+    # 1. 环境配置与依赖安装
     - name: Setup Build Environment and Install Dependencies
       run: |
         sudo apt-get update
@@ -106,7 +107,7 @@ jobs:
         [[ -f net/netfilter/xt_qtaguid.c && -f utils/xt_qtaguid.patch ]] && patch -p0 < utils/xt_qtaguid.patch || true
         echo "✅ LXC 补丁应用完成"
 
-    # 5. 检查 LXC 补丁配置是否有效
+    # 5. 检查 LXC 补丁配置是否有效 (修复 HOSTLD 错误)
     - name: Verify Docker/LXC requirements via moby check-config.sh
       if: ${{ inputs.enable_lxc }}
       working-directory: workspace
@@ -115,15 +116,15 @@ jobs:
         OUT_PATH="../out/${{ inputs.device_code }}/${{ env.BUILD_VARIANT }}"
         echo "🔍 正在检查 LXC/Docker 依赖配置..."
 
-        # 修复 HOSTCC 错误: 使用 HOSTCC=gcc 来编译主机工具
-        make ${BUILD_ARGS_BASE} O=$OUT_PATH ${{ inputs.defconfig_name }} HOSTCC=gcc
+        # 【修复点 1】强制使用 HOSTCC=gcc 和 HOSTLD=ld 避免 Linker 冲突
+        make ${BUILD_ARGS_BASE} O=$OUT_PATH ${{ inputs.defconfig_name }} HOSTCC=gcc HOSTLD=ld
         
         curl -fsSL https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh -o /tmp/check-config.sh
         chmod +x /tmp/check-config.sh
         /tmp/check-config.sh $OUT_PATH/.config
         echo "✅ 配置检查通过。"
         
-    # 6. 编译内核，然后打包
+    # 6. 编译内核，然后打包 (修复 HOSTLD 错误)
     - name: Build and Package Kernel (Vanilla)
       working-directory: workspace
       run: |
@@ -138,13 +139,14 @@ jobs:
         ANYKERNEL_DIR="AnyKernel3"
         DEFCONFIG_FULL_PATH="arch/arm64/configs/$DEFCONFIG_NAME"
         
-        # 编译参数: 包含 HOSTCC=gcc
-        BUILD_ARGS="$BUILD_ARGS_BASE O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner KBUILD_CFLAGS+='-Wno-unused-command-line-argument' HOSTCC=gcc" 
+        # 编译参数: 包含 HOSTCC=gcc, HOSTLD=ld, HOSTLDFLAGS='' (防止 Linker 干扰)
+        BUILD_ARGS="$BUILD_ARGS_BASE O=$OUT -j$THREAD KBUILD_BUILD_USER=GitHubAction KBUILD_BUILD_HOST=GitHub-Runner KBUILD_CFLAGS+='-Wno-unused-command-line-argument' HOSTCC=gcc HOSTLD=ld HOSTLDFLAGS=''" 
 
         # --- 1. 清理和配置 ---
         echo "--- 1. CLEANING AND CONFIGURING ---"
-        make -s mrproper -j$THREAD HOSTCC=gcc
-        make -s clean -j$THREAD HOSTCC=gcc
+        # 清理命令也必须包含 HOSTCC/HOSTLD
+        make -s mrproper -j$THREAD HOSTCC=gcc HOSTLD=ld
+        make -s clean -j$THREAD HOSTCC=gcc HOSTLD=ld
         rm -rf "$OUT"
         
         # 执行 Defconfig
