@@ -21,12 +21,12 @@ jobs:
           arch: arm64
           aosp-gcc: true
           aosp-clang: true
+          android-version: 13
+          aosp-clang-version: r450784d
+          disable-lto: true
           ksu: true
           ksu-version: main
           lxc: true
           lxc-patch: true
           anykernel3: true
           release: true
-          android-version: 13
-          aosp-clang-version: r450784e
-          disable-lto: true
