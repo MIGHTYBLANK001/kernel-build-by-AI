@@ -28,5 +28,5 @@ jobs:
           anykernel3: true
           release: true
           android-version: 13
-          aosp-clang-version: r383902
+          aosp-clang-version: r450784e
           disable-lto: true
