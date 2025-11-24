@@ -19,9 +19,10 @@ jobs:
           kernel-branch: 13.0
           config: vendor/picasso_user_defconfig
           arch: arm64
+          aosp-gcc: true
           aosp-clang: true
-          android-version: 13
-          aosp-clang-version: r450784d
+          android-version: ""
+          aosp-clang-version: r522817
           disable-lto: true
           ksu: true
           ksu-version: main
