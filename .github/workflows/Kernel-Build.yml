@@ -16,7 +16,7 @@ jobs:
         uses: dabao1955/kernel_build_action@main
         with:
           kernel-url: https://github.com/MIGHTYBLANK001/picasso-android_kernel_xiaomi_sm7250
-          kernel-branch: 13.0
+          kernel-branch: "13.0"
           config: vendor/picasso_user_defconfig
           arch: arm64
           aosp-gcc: true
