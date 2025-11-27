@@ -24,9 +24,9 @@ jobs:
           android-version: ""
           aosp-clang-version: r547379
           disable-lto: true
-          ksu: true
+          ksu: false
           ksu-version: main
           lxc: true
-          #lxc-patch: lxc-patch
+          lxc-patch: true
           anykernel3: true
           release: true
