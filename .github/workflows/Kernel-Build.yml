@@ -27,6 +27,6 @@ jobs:
           ksu: false
           ksu-version: main
           lxc: true
-          lxc-patch: true
+          lxc-patch: false
           anykernel3: true
           release: true
